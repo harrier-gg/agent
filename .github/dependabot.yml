@@ -1,0 +1,24 @@
+# Keeps dependencies and the SHA-pinned GitHub Actions up to date. PR titles follow
+# Conventional Commits ("chore(deps): …"), so they pass the "pr / title" check and do not trigger a release.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      github-actions:
+        patterns: ["*"]

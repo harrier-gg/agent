@@ -2,6 +2,6 @@
 import type { Hello } from "./Hello";
 
 /**
- * Nachrichten vom Agent an das Panel.
+ * Messages from the agent to the panel.
  */
 export type AgentMessage = { "type": "hello" } & Hello;

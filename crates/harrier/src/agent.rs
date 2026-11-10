@@ -7,30 +7,30 @@ use tracing::{error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Verbindet sich mit dem Panel und hält die Verbindung. Bei Abbruch wird mit wachsender
-/// Pause neu verbunden. Eine Ablehnung (z. B. falsche Protokollversion) beendet den Agent,
-/// weil ein erneuter Versuch nichts ändern würde.
+/// Connects to the panel and keeps the connection. When it drops, the agent reconnects with a
+/// growing pause. A rejection (e.g. wrong protocol version) stops the agent, because retrying
+/// would not change anything.
 pub async fn run(panel: &str) -> anyhow::Result<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
         tokio::select! {
             result = session(panel) => match result {
                 Ok(Outcome::Rejected(reason)) => {
-                    error!("Panel hat den Agent abgelehnt: {reason}");
+                    error!("The panel rejected this agent: {reason}");
                     std::process::exit(2);
                 }
                 Ok(Outcome::Closed) => {
-                    warn!("Verbindung zum Panel getrennt");
+                    warn!("Connection to the panel closed");
                     backoff = Duration::from_secs(1);
                 }
-                Err(e) => warn!("Verbindung fehlgeschlagen: {e:#}"),
+                Err(e) => warn!("Connection failed: {e:#}"),
             },
             _ = tokio::signal::ctrl_c() => {
-                info!("Beende Agent");
+                info!("Stopping agent");
                 return Ok(());
             }
         }
-        info!("Neuer Versuch in {}s", backoff.as_secs());
+        info!("Retrying in {}s", backoff.as_secs());
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
@@ -44,7 +44,7 @@ enum Outcome {
 async fn session(panel: &str) -> anyhow::Result<Outcome> {
     let (mut ws, _) = connect_async(panel)
         .await
-        .with_context(|| format!("Verbinden mit {panel}"))?;
+        .with_context(|| format!("Connecting to {panel}"))?;
 
     let hello = AgentMessage::Hello(Hello {
         protocol: PROTOCOL_VERSION,
@@ -61,13 +61,13 @@ async fn session(panel: &str) -> anyhow::Result<Outcome> {
         match serde_json::from_str::<PanelMessage>(&text)? {
             PanelMessage::Welcome(w) => {
                 info!(
-                    "Mit Panel verbunden als {} (Protokoll {})",
+                    "Connected to the panel as {} (protocol {})",
                     w.agent_id, w.protocol
                 )
             }
             PanelMessage::Reject(r) => {
                 return Ok(Outcome::Rejected(format!(
-                    "{} (Panel unterstützt Protokoll {}–{}, Agent spricht {PROTOCOL_VERSION})",
+                    "{} (panel supports protocol {}–{}, agent speaks {PROTOCOL_VERSION})",
                     r.reason, r.min_protocol, r.max_protocol
                 )));
             }
@@ -86,5 +86,5 @@ fn hostname() -> String {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         })
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "unbekannt".into())
+        .unwrap_or_else(|| "unknown".into())
 }

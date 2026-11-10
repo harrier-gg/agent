@@ -1,6 +1,6 @@
 [package]
 name = "harrier-protocol"
-description = "Nachrichten zwischen Agent und Panel. Quelle der Wahrheit für das Protokoll."
+description = "Messages between agent and panel. Source of truth for the protocol."
 version.workspace = true
 edition.workspace = true
 

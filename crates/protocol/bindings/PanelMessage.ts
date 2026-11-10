@@ -3,6 +3,6 @@ import type { Reject } from "./Reject";
 import type { Welcome } from "./Welcome";
 
 /**
- * Nachrichten vom Panel an den Agent.
+ * Messages from the panel to the agent.
  */
 export type PanelMessage = { "type": "welcome" } & Welcome | { "type": "reject" } & Reject;
