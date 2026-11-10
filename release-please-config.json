@@ -4,7 +4,14 @@
     ".": {
       "release-type": "simple",
       "package-name": "harrier-agent",
-      "extra-files": [{ "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" }]
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        }
+      ],
+      "include-component-in-tag": false
     }
   }
 }
