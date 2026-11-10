@@ -1,0 +1,12 @@
+[package]
+name = "harrier-protocol"
+description = "Nachrichten zwischen Agent und Panel. Quelle der Wahrheit für das Protokoll."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+ts-rs = "11"
+
+[dev-dependencies]
+serde_json.workspace = true
