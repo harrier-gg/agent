@@ -13,7 +13,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - name: Protokoll-Typen sind aktuell (sonst `just protocol` ausführen und committen)
+      - name: Protocol types are up to date (otherwise run `just protocol` and commit)
         run: |
           rm -rf crates/protocol/bindings
           cargo test -p harrier-protocol export_bindings --quiet

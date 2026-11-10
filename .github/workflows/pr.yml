@@ -1,0 +1,12 @@
+name: PR
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  # Shared checks "pr / title" and "pr / template", maintained in harrier-gg/.github.
+  pr:
+    uses: harrier-gg/.github/.github/workflows/pr-checks.yml@main

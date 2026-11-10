@@ -1,5 +1,5 @@
-//! `harrier`: Agent und CLI in einer Binary.
-//! M0: `harrier agent run` verbindet sich mit dem Panel und macht den Handshake.
+//! `harrier`: agent and CLI in one binary.
+//! M0: `harrier agent run` connects to the panel and performs the handshake.
 
 mod agent;
 
@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "harrier", version, about = "Harrier Game-Server-Manager")]
+#[command(name = "harrier", version, about = "Harrier game server manager")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -15,7 +15,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Agent-Befehle
+    /// Agent commands
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -24,9 +24,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Agent starten und mit dem Panel verbinden
+    /// Start the agent and connect it to the panel
     Run {
-        /// WebSocket-URL des Panels
+        /// WebSocket URL of the panel
         #[arg(
             long,
             env = "HARRIER_PANEL_URL",

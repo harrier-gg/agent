@@ -1,23 +1,23 @@
-//! Nachrichten zwischen Agent und Panel (Gateway), als JSON über WebSocket.
+//! Messages between agent and panel (gateway), as JSON over WebSocket.
 //!
-//! Diese Typen sind die Quelle der Wahrheit. `just protocol` erzeugt daraus TypeScript-Typen
-//! (`bindings/`), die das Backend übernimmt.
+//! These types are the source of truth. `just protocol` generates TypeScript types from them
+//! (`bindings/`), which the backend takes over.
 //!
-//! Versionierung (ADR 0002): Inkompatible Änderungen erhöhen [`PROTOCOL_VERSION`]. Das Panel
-//! unterstützt immer die aktuelle und die vorherige Version.
+//! Versioning (ADR 0002): incompatible changes increase [`PROTOCOL_VERSION`]. The panel
+//! always supports the current and the previous version.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Protokollversion, die dieser Agent spricht.
+/// Protocol version this agent speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Nachrichten vom Agent an das Panel.
+/// Messages from the agent to the panel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(export)]
 pub enum AgentMessage {
-    /// Erste Nachricht nach dem Verbinden.
+    /// First message after connecting.
     Hello(Hello),
 }
 
@@ -32,14 +32,14 @@ pub struct Hello {
     pub hostname: String,
 }
 
-/// Nachrichten vom Panel an den Agent.
+/// Messages from the panel to the agent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(export)]
 pub enum PanelMessage {
-    /// Handshake angenommen. `protocol` ist die Version, die ab jetzt gesprochen wird.
+    /// Handshake accepted. `protocol` is the version spoken from now on.
     Welcome(Welcome),
-    /// Handshake abgelehnt, die Verbindung wird danach geschlossen.
+    /// Handshake rejected; the connection is closed afterwards.
     Reject(Reject),
 }
 
@@ -66,7 +66,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn hello_hat_das_vereinbarte_json_format() {
+    fn hello_has_the_agreed_json_format() {
         let msg = AgentMessage::Hello(Hello {
             protocol: 1,
             agent_version: "0.1.0".into(),
@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn antworten_des_panels_werden_gelesen() {
+    fn panel_replies_are_parsed() {
         let welcome: PanelMessage =
             serde_json::from_value(json!({"type": "welcome", "protocol": 1, "agentId": "a1"}))
                 .unwrap();
@@ -94,7 +94,7 @@ mod tests {
         );
 
         let reject: PanelMessage = serde_json::from_value(
-            json!({"type": "reject", "reason": "zu alt", "minProtocol": 2, "maxProtocol": 3}),
+            json!({"type": "reject", "reason": "too old", "minProtocol": 2, "maxProtocol": 3}),
         )
         .unwrap();
         assert!(matches!(reject, PanelMessage::Reject(r) if r.min_protocol == 2));

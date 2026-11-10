@@ -14,5 +14,16 @@ jobs:
       released: ${{ steps.release.outputs.release_created }}
       tag: ${{ steps.release.outputs.tag_name }}
     steps:
+      # Release PRs opened with the default GITHUB_TOKEN do not trigger other workflows, so the
+      # required checks would never run on them. With the Harrier release bot (a GitHub App,
+      # org variable RELEASE_APP_CLIENT_ID + org secret RELEASE_APP_PRIVATE_KEY) they run normally.
+      - id: app-token
+        if: ${{ vars.RELEASE_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - id: release
         uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ steps.app-token.outputs.token || github.token }}

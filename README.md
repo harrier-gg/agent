@@ -1,20 +1,22 @@
 # Harrier Agent
 
-Agent und CLI in einer Rust-Binary (`harrier`). Der Agent läuft auf jedem Rechner, der Spieleserver hostet, und verbindet sich **von sich aus** mit dem Panel – keine Portfreigabe, kein Zertifikat auf dem Host nötig.
+Agent and CLI in one Rust binary (`harrier`). The agent runs on every machine that hosts game servers and connects to the panel **on its own** (outbound): no port forwarding and no certificate needed on the host.
 
-| Crate | Zweck |
+| Crate | Purpose |
 |---|---|
-| `crates/protocol` | Nachrichten Agent ↔ Panel. Quelle der Wahrheit, erzeugt TypeScript-Typen nach `bindings/` |
-| `crates/harrier` | Binary: `harrier agent run` (später auch `install`, `update`, `doctor`, `template …`) |
+| `crates/protocol` | Messages agent ↔ panel. Source of truth; generates TypeScript types into `bindings/` |
+| `crates/harrier` | Binary: `harrier agent run` (later also `install`, `update`, `doctor`, `template …`) |
 
-## Entwickeln
+## Development
 
-Voraussetzungen: Rust (Version aus `rust-toolchain.toml`, wird von rustup automatisch installiert), [just](https://just.systems).
+Requirements: Rust (version from `rust-toolchain.toml`, installed automatically by rustup), [just](https://just.systems).
 
 ```bash
-just dev        # Agent gegen das lokale Panel (ws://localhost:8080/agent/ws)
-just protocol   # TypeScript-Typen neu erzeugen, danach in ../backend `just protocol`
-just check      # Alles, was die CI prüft
+just dev        # agent against the local panel (ws://localhost:8080/agent/ws)
+just protocol   # regenerate the TypeScript types, then run `just protocol` in ../backend
+just check      # everything CI checks
 ```
 
-Protokoll-Versionierung: siehe ADR 0002 im `.github`-Repo.
+Protocol versioning: see [ADR 0002](https://github.com/harrier-gg/.github/blob/main/adr/0002-agent-protocol-versioning.md). Log messages and CLI output are English only ([ADR 0003](https://github.com/harrier-gg/.github/blob/main/adr/0003-internationalization.md)).
+
+See the [contributing guide](https://github.com/harrier-gg/.github/blob/main/CONTRIBUTING.md) for branches, PRs and releases.

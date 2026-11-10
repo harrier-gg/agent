@@ -1,6 +1,6 @@
 [package]
 name = "harrier"
-description = "Harrier Agent und CLI"
+description = "Harrier agent and CLI"
 version.workspace = true
 edition.workspace = true
 
