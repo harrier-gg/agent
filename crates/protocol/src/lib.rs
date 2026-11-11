@@ -7,6 +7,7 @@
 //! always supports the current and the previous version.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use ts_rs::TS;
 
 /// Protocol version this agent speaks.
@@ -19,6 +20,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub enum AgentMessage {
     /// First message after connecting.
     Hello(Hello),
+    /// A server changed its status (also sent for every known server after connecting).
+    ServerState(ServerState),
+    /// Raw console output of a server (may contain ANSI escape codes).
+    ConsoleOutput(ConsoleOutput),
+    /// Resource usage of a running server, sent every few seconds.
+    ServerStats(ServerStats),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -41,6 +48,12 @@ pub enum PanelMessage {
     Welcome(Welcome),
     /// Handshake rejected; the connection is closed afterwards.
     Reject(Reject),
+    /// Create (or recreate) and start a server from a runtime spec.
+    StartServer(StartServer),
+    /// Stop a server gracefully (falls back to killing it after `stopTimeoutSecs`).
+    StopServer(ServerRef),
+    /// Write one line to a server's console.
+    SendCommand(SendCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -58,6 +71,109 @@ pub struct Reject {
     pub reason: String,
     pub min_protocol: u32,
     pub max_protocol: u32,
+}
+
+/// Everything the agent needs to run a server. Game-neutral (ADR 0005): the panel turns a
+/// template and the user's settings into this spec; the agent knows no games.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RuntimeSpec {
+    pub image: String,
+    #[ts(type = "Record<string, string>")]
+    pub env: BTreeMap<String, String>,
+    pub ports: Vec<PortMapping>,
+    pub memory_mb: u32,
+    /// Regular expression on the console output that marks the server as running.
+    /// Without it, the server counts as running as soon as the process started.
+    #[serde(default)]
+    pub ready_pattern: Option<String>,
+    pub stop_timeout_secs: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PortMapping {
+    pub container_port: u16,
+    pub host_port: u16,
+    pub protocol: PortProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct StartServer {
+    pub server_id: String,
+    pub spec: RuntimeSpec,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerRef {
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SendCommand {
+    pub server_id: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ServerStatus {
+    /// Downloading the image or files.
+    Installing,
+    Starting,
+    Running,
+    Stopping,
+    Stopped,
+    /// The process exited without being asked to stop.
+    Crashed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerState {
+    pub server_id: String,
+    pub status: ServerStatus,
+    /// Human-readable detail, e.g. an error or download progress (English).
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ConsoleOutput {
+    pub server_id: String,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerStats {
+    pub server_id: String,
+    pub cpu_percent: f64,
+    #[ts(type = "number")]
+    pub memory_bytes: u64,
+    #[ts(type = "number")]
+    pub memory_limit_bytes: u64,
 }
 
 #[cfg(test)]
@@ -98,5 +214,39 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(reject, PanelMessage::Reject(r) if r.min_protocol == 2));
+    }
+
+    #[test]
+    fn start_server_has_the_agreed_json_format() {
+        let msg: PanelMessage = serde_json::from_value(json!({
+            "type": "startServer",
+            "serverId": "s1",
+            "spec": {
+                "image": "itzg/minecraft-server:java21",
+                "env": {"TYPE": "PAPER", "EULA": "TRUE"},
+                "ports": [{"containerPort": 25565, "hostPort": 25566, "protocol": "tcp"}],
+                "memoryMb": 2048,
+                "readyPattern": "Done \\(",
+                "stopTimeoutSecs": 30
+            }
+        }))
+        .unwrap();
+        let PanelMessage::StartServer(start) = msg else {
+            panic!("expected startServer")
+        };
+        assert_eq!(start.spec.ports[0].protocol, PortProtocol::Tcp);
+        assert_eq!(start.spec.env["TYPE"], "PAPER");
+    }
+
+    #[test]
+    fn server_state_omits_nothing_and_message_is_optional() {
+        let state: AgentMessage = serde_json::from_value(
+            json!({"type": "serverState", "serverId": "s1", "status": "running"}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            json!({"type": "serverState", "serverId": "s1", "status": "running", "message": null})
+        );
     }
 }
