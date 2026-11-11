@@ -81,7 +81,7 @@ fn parse_minecraft_status(json: &[u8]) -> anyhow::Result<Players> {
     })
 }
 
-fn write_varint(mut value: u32, out: &mut Vec<u8>) {
+pub(crate) fn write_varint(mut value: u32, out: &mut Vec<u8>) {
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -93,7 +93,7 @@ fn write_varint(mut value: u32, out: &mut Vec<u8>) {
     }
 }
 
-async fn read_varint(input: &mut (impl AsyncRead + Unpin)) -> anyhow::Result<u32> {
+pub(crate) async fn read_varint(input: &mut (impl AsyncRead + Unpin)) -> anyhow::Result<u32> {
     let mut value = 0u32;
     for i in 0..5 {
         let byte = input.read_u8().await?;
