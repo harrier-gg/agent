@@ -16,4 +16,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 bollard = "0.21.1"
 regex = "1.13.1"
-libc = "0.2"
+cap-std = "3"

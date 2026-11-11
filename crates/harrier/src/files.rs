@@ -1,20 +1,21 @@
 //! Reads and writes text files inside a server's data directory (ADR 0011). The agent checks
 //! every path itself, so even a compromised panel cannot reach files outside that directory.
+//!
+//! All access goes through a `cap_std::fs::Dir` opened on that directory: every path component
+//! is opened relative to its parent, so `..` and symlinks can never lead outside, not even if the
+//! game swaps a directory for a symlink while the agent is working (no check-then-open race).
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path, PathBuf};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Component, Path};
 
 /// Fits one agent message (256 KiB in the gateway) even with JSON escaping.
 const MAX_BYTES: u64 = 128 * 1024;
 
-/// Turns a relative path into one inside `root`. Rejects absolute paths, `..`, and symlinks in
-/// any existing part of the path; `O_NOFOLLOW` covers the file itself when it is opened.
-// ponytail: checking the directories before opening leaves a short race for nested paths (a
-// game process could swap a directory for a symlink in between); the file manager (M6) should
-// open each component relative to its parent (openat / cap-std).
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+/// Accepts only plain relative paths (`config/paper.yml`), so errors are clear before cap-std
+/// would refuse them anyway.
+fn relative(path: &str) -> Result<&Path, String> {
     let relative = Path::new(path);
     if path.is_empty()
         || !relative
@@ -23,26 +24,20 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     {
         return Err(format!("Invalid path \"{path}\""));
     }
-    let mut full = root.to_path_buf();
-    for component in relative.components() {
-        full.push(component);
-        if std::fs::symlink_metadata(&full).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(format!("\"{path}\" is a symlink"));
-        }
-    }
-    Ok(full)
+    Ok(relative)
+}
+
+fn open_root(root: &Path) -> std::io::Result<Dir> {
+    Dir::open_ambient_dir(root, ambient_authority())
 }
 
 /// The file's text, or `None` if it does not exist.
 pub fn read(root: &Path, path: &str) -> Result<Option<String>, String> {
-    let full = resolve(root, path)?;
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&full)
-    {
+    let relative = relative(path)?;
+    let opened = open_root(root).and_then(|dir| dir.open(relative));
+    let file = match opened {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Opening \"{path}\": {e}")),
     };
     let meta = file.metadata().map_err(|e| e.to_string())?;
@@ -67,33 +62,38 @@ pub fn write(root: &Path, path: &str, content: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_BYTES {
         return Err("The content is larger than 128 KiB".into());
     }
-    let full = resolve(root, path)?;
-    let parent = full.parent().unwrap_or(root);
-    std::fs::create_dir_all(parent).map_err(|e| format!("Creating the directory: {e}"))?;
-    if full.is_dir() {
+    let relative = relative(path)?;
+    let failed = |e: std::io::Error| format!("Writing \"{path}\": {e}");
+    // The root itself comes from the agent's data directory and a checked server ID.
+    std::fs::create_dir_all(root).map_err(failed)?;
+    let dir = open_root(root).map_err(failed)?;
+    let parent = relative.parent().unwrap_or(Path::new(""));
+    if !parent.as_os_str().is_empty() {
+        dir.create_dir_all(parent).map_err(failed)?;
+    }
+    if dir.metadata(relative).is_ok_and(|m| m.is_dir()) {
         return Err(format!("\"{path}\" is a directory"));
     }
-    let name = full.file_name().unwrap_or_default().to_string_lossy();
+    let name = relative.file_name().unwrap_or_default().to_string_lossy();
     let temp = parent.join(format!(".{name}.harrier-tmp"));
-    let _ = std::fs::remove_file(&temp);
-    let mut file: File = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)
-        .map_err(|e| format!("Writing \"{path}\": {e}"))?;
+    let _ = dir.remove_file(&temp);
+    let mut file = dir
+        .open_with(&temp, OpenOptions::new().write(true).create_new(true))
+        .map_err(failed)?;
+    // rename replaces a symlink at the target itself; it never writes through it.
     file.write_all(content.as_bytes())
         .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&temp, &full))
+        .and_then(|()| dir.rename(&temp, &dir, relative))
         .map_err(|e| {
-            let _ = std::fs::remove_file(&temp);
-            format!("Writing \"{path}\": {e}")
+            let _ = dir.remove_file(&temp);
+            failed(e)
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!("harrier-files-{}", std::process::id()));
@@ -135,7 +135,13 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret"), root.join("link")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("dir")).unwrap();
         assert!(read(&root, "link").is_err());
-        assert!(write(&root, "link", "y").is_err());
+        // Writing replaces the link with a regular file inside; the target stays untouched.
+        write(&root, "link", "y").unwrap();
+        assert!(
+            !std::fs::symlink_metadata(root.join("link"))
+                .unwrap()
+                .is_symlink()
+        );
         assert!(read(&root, "dir/secret").is_err());
         assert!(write(&root, "dir/new", "y").is_err());
         assert_eq!(
