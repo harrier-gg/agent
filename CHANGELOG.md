@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0](https://github.com/harrier-gg/agent/compare/v0.4.0...v0.5.0) (2026-11-11)
+
+
+### Features
+
+* backups with consistent copies, pruning and restore ([#16](https://github.com/harrier-gg/agent/issues/16)) ([ebd7392](https://github.com/harrier-gg/agent/commit/ebd739282c97fe5e4b4e799ed06743f69220aaf9))
+* file manager operations and a transfer channel for uploads and downloads ([#14](https://github.com/harrier-gg/agent/issues/14)) ([34f8cf3](https://github.com/harrier-gg/agent/commit/34f8cf37e299c874755d0ac1236c118002aa724d))
+
+
+### Bug Fixes
+
+* match console output by whole lines only ([#17](https://github.com/harrier-gg/agent/issues/17)) ([5400a7c](https://github.com/harrier-gg/agent/commit/5400a7ca354cc25d77f86b6541b8f3d218340d15))
+
 ## [0.4.0](https://github.com/harrier-gg/agent/compare/v0.3.0...v0.4.0) (2026-11-11)
 
 
