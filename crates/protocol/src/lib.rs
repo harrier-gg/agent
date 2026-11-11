@@ -28,6 +28,8 @@ pub enum AgentMessage {
     ServerStats(ServerStats),
     /// Who is online, for servers whose spec has a `query` (ADR 0009). Sent every few seconds.
     ServerPlayers(ServerPlayers),
+    /// A backup or restore finished (ADR 0016); they take too long for a request.
+    BackupResult(BackupResult),
     /// Reply to `readFile` or `writeFile` (ADR 0011).
     FileResult(FileResult),
 }
@@ -75,6 +77,100 @@ pub enum PanelMessage {
     SendFile(Transfer),
     /// Receive a file from the panel over the transfer channel and put it at `path`.
     ReceiveFile(Transfer),
+    /// Back up a server now and keep the newest `keep` (ADR 0016). Answered with `backupResult`.
+    CreateBackup(CreateBackup),
+    /// The backups of a server, newest first, as `fileResult` with `entries`.
+    ListBackups(ServerRequest),
+    /// Delete one backup; answered with `fileResult`.
+    DeleteBackup(BackupRef),
+    /// Restore a stopped server from a backup; answered with `backupResult`.
+    RestoreBackup(RestoreBackup),
+    /// Stream a backup to the panel over the transfer channel; `path` is the backup's name.
+    SendBackup(Transfer),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerRequest {
+    pub request_id: String,
+    pub server_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BackupRef {
+    pub request_id: String,
+    pub server_id: String,
+    /// File name of the backup, as listed.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct CreateBackup {
+    pub server_id: String,
+    /// Backups to keep; older ones are deleted after this one is complete.
+    pub keep: u32,
+    /// How to get a consistent copy while the server runs; without it, it is copied as it is.
+    #[serde(default)]
+    pub quiesce: Option<Quiesce>,
+    /// Top-level entries left out, like downloaded server files: a name or `*.jar`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreBackup {
+    pub request_id: String,
+    pub server_id: String,
+    pub name: String,
+    /// The backup's `exclude`: these top-level entries are kept from the current state.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// Console commands around a backup of a running server (ADR 0016).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Quiesce {
+    /// Sent before copying, e.g. `save-off`, `save-all flush`.
+    pub before: Vec<String>,
+    /// Regular expression on the console output that confirms the game saved.
+    #[serde(default)]
+    pub ready: Option<String>,
+    /// Sent after copying, e.g. `save-on`.
+    pub after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum BackupAction {
+    Create,
+    Restore,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BackupResult {
+    pub server_id: String,
+    pub action: BackupAction,
+    /// The backup created or restored.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub size: Option<u64>,
+    /// Why it failed (English); `null` on success.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

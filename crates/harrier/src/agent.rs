@@ -162,6 +162,21 @@ async fn session(
             PanelMessage::MovePath(request) => {
                 tokio::spawn(runtime.clone().move_path(request));
             }
+            PanelMessage::CreateBackup(request) => {
+                tokio::spawn(runtime.clone().create_backup(request));
+            }
+            PanelMessage::ListBackups(request) => {
+                tokio::spawn(runtime.clone().list_backups(request));
+            }
+            PanelMessage::DeleteBackup(request) => {
+                tokio::spawn(runtime.clone().delete_backup(request));
+            }
+            PanelMessage::RestoreBackup(request) => {
+                tokio::spawn(runtime.clone().restore_backup(request));
+            }
+            PanelMessage::SendBackup(request) => {
+                tokio::spawn(runtime.clone().send_backup(request));
+            }
             PanelMessage::SendFile(request) => {
                 tokio::spawn(runtime.clone().send_file(request));
             }
