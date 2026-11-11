@@ -133,6 +133,48 @@ pub struct RuntimeSpec {
     /// How to ask the running server who is online. Without it, there is no player list.
     #[serde(default)]
     pub query: Option<QuerySpec>,
+    /// Put the server to sleep when nobody is online (ADR 0013). Needs `query`.
+    #[serde(default)]
+    pub sleep: Option<SleepSpec>,
+}
+
+/// When to sleep and how to wake (ADR 0013).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SleepSpec {
+    /// Minutes with nobody online before the server is stopped (at least 1).
+    pub idle_minutes: u32,
+    /// How players wake it by connecting. Without it, only the panel wakes it.
+    #[serde(default)]
+    pub wake: Option<WakeSpec>,
+}
+
+/// While asleep, the agent answers on the game port itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WakeSpec {
+    pub protocol: WakeProtocol,
+    /// Host port players connect to.
+    pub port: u16,
+    /// Shown in the game's server list while asleep.
+    pub status_text: String,
+    /// Shown to a player whose connection wakes the server.
+    pub join_text: String,
+}
+
+/// Network protocols the agent can answer while a server sleeps, not games.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum WakeProtocol {
+    /// Minecraft: Java Edition (server list ping and login).
+    Minecraft,
+    /// A protocol of a newer panel; this agent only wakes from the panel.
+    #[serde(other)]
+    #[ts(skip)]
+    Unsupported,
 }
 
 /// A query protocol and the host port it answers on (ADR 0009).
@@ -209,6 +251,8 @@ pub enum ServerStatus {
     Stopped,
     /// The process exited without being asked to stop.
     Crashed,
+    /// Stopped because nobody was online; wakes on connect or from the panel (ADR 0013).
+    Sleeping,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

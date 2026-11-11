@@ -1,7 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
-use crate::{files, query};
+use crate::{files, query, wake};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -12,7 +12,8 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use harrier_protocol::{
     AgentMessage, ConsoleOutput, FileResult, PortProtocol, QueryProtocol, QuerySpec, ReadFile,
-    Restart, RuntimeSpec, ServerPlayers, ServerState, ServerStats, ServerStatus, WriteFile,
+    Restart, RuntimeSpec, ServerPlayers, ServerState, ServerStats, ServerStatus, SleepSpec,
+    WakeProtocol, WriteFile,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
 use tracing::{info, warn};
 
@@ -32,6 +34,12 @@ const LABEL: &str = "gg.harrier.server";
 /// The spec's `query`, kept on the container so a restarted agent keeps asking (ADR 0009).
 const QUERY_LABEL: &str = "gg.harrier.query";
 const PLAYERS_INTERVAL: Duration = Duration::from_secs(10);
+/// The spec's `sleep` and `readyPattern`, kept on the container so a restarted agent can keep a
+/// server asleep and report correctly when it wakes (ADR 0013).
+const SLEEP_LABEL: &str = "gg.harrier.sleep";
+const READY_LABEL: &str = "gg.harrier.ready";
+/// Marker files of sleeping servers, next to (never inside) the servers' data directories.
+const SLEEPING_DIR: &str = ".harrier-sleeping";
 const DEFAULT_STOP_TIMEOUT_SECS: i32 = 30;
 /// Waits before restarting a crashed server; its length is the number of attempts (ADR 0010).
 const RESTART_DELAYS_SECS: [u64; 3] = [10, 30, 60];
@@ -55,7 +63,9 @@ struct Running {
     /// Replaced after every restart.
     stdin: tokio::sync::Mutex<Option<Stdin>>,
     stopping: AtomicBool,
-    /// Wakes a pending restart, so stopping does not wait for it.
+    /// Stopped (or being stopped) because nobody was online (ADR 0013).
+    sleeping: AtomicBool,
+    /// Ends a pending restart or a sleep: the server was stopped or started from the panel.
     wake: Notify,
     stop_timeout_secs: i32,
 }
@@ -125,32 +135,46 @@ impl Runtime {
                 container.state,
                 Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
             );
-            let known = self.servers.lock().unwrap().contains_key(&server_id);
-            if !running {
-                // A known server that is not running waits for a restart and reports itself.
-                if !known {
-                    self.state(&server_id, ServerStatus::Stopped, None);
+            let known = self.servers.lock().unwrap().get(&server_id).cloned();
+            let label = |key: &str| container.labels.as_ref().and_then(|l| l.get(key)).cloned();
+            let query = label(QUERY_LABEL).and_then(|q| serde_json::from_str::<QuerySpec>(&q).ok());
+            let sleep = label(SLEEP_LABEL).and_then(|s| serde_json::from_str::<SleepSpec>(&s).ok());
+            let asleep = !running && self.sleep_marker(&server_id).exists();
+            if let Some(known) = known {
+                // Known servers report themselves; only states the panel may have missed are sent.
+                if running {
+                    self.state(&server_id, ServerStatus::Running, None);
+                } else if known.sleeping.load(Ordering::SeqCst) {
+                    self.state(&server_id, ServerStatus::Sleeping, None);
                 }
                 continue;
             }
-            let query = container
-                .labels
-                .as_ref()
-                .and_then(|l| l.get(QUERY_LABEL))
-                .and_then(|q| serde_json::from_str::<QuerySpec>(q).ok());
-            if known {
-                self.state(&server_id, ServerStatus::Running, None);
-            } else {
-                let this = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = this
-                        .supervise(&server_id, None, DEFAULT_STOP_TIMEOUT_SECS, query)
-                        .await
-                    {
-                        warn!("Re-attaching to {server_id} failed: {e:#}");
-                    }
-                });
+            if !running && !asleep {
+                self.state(&server_id, ServerStatus::Stopped, None);
+                continue;
             }
+            // A running server has printed its ready line long ago; a sleeping one will again.
+            let ready = if asleep {
+                label(READY_LABEL).and_then(|r| Regex::new(&r).ok())
+            } else {
+                None
+            };
+            let this = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = this
+                    .supervise(
+                        &server_id,
+                        ready,
+                        DEFAULT_STOP_TIMEOUT_SECS,
+                        query,
+                        sleep,
+                        asleep,
+                    )
+                    .await
+                {
+                    warn!("Re-attaching to {server_id} failed: {e:#}");
+                }
+            });
         }
         Ok(())
     }
@@ -165,7 +189,13 @@ impl Runtime {
     }
 
     async fn try_start(self: Arc<Self>, server_id: &str, spec: RuntimeSpec) -> anyhow::Result<()> {
-        if self.servers.lock().unwrap().contains_key(server_id) {
+        let existing = self.servers.lock().unwrap().get(server_id).cloned();
+        if let Some(running) = existing {
+            // Starting a sleeping server wakes it: the same container starts again (ADR 0013).
+            if running.sleeping.load(Ordering::SeqCst) {
+                running.wake.notify_one();
+                return Ok(());
+            }
             anyhow::bail!("The server is already running");
         }
         let name = container_name(server_id);
@@ -225,6 +255,12 @@ impl Runtime {
         if let Some(query) = &spec.query {
             labels.insert(QUERY_LABEL.to_string(), serde_json::to_string(query)?);
         }
+        if let Some(sleep) = &spec.sleep {
+            labels.insert(SLEEP_LABEL.to_string(), serde_json::to_string(sleep)?);
+        }
+        if let Some(ready) = &spec.ready_pattern {
+            labels.insert(READY_LABEL.to_string(), ready.clone());
+        }
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
@@ -269,7 +305,10 @@ impl Runtime {
         let this = self.clone();
         let id = server_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = this.supervise(&id, ready, timeout, spec.query).await {
+            if let Err(e) = this
+                .supervise(&id, ready, timeout, spec.query, spec.sleep, false)
+                .await
+            {
                 warn!("Supervising {id} failed: {e:#}");
             }
         });
@@ -284,10 +323,13 @@ impl Runtime {
         ready: Option<Regex>,
         stop_timeout_secs: i32,
         query: Option<QuerySpec>,
+        sleep: Option<SleepSpec>,
+        asleep: bool,
     ) -> anyhow::Result<()> {
         let running = Arc::new(Running {
             stdin: tokio::sync::Mutex::new(None),
             stopping: AtomicBool::new(false),
+            sleeping: AtomicBool::new(asleep),
             wake: Notify::new(),
             stop_timeout_secs,
         });
@@ -295,7 +337,9 @@ impl Runtime {
             .lock()
             .unwrap()
             .insert(server_id.to_string(), running.clone());
-        let result = self.run_until_done(server_id, &running, ready, query).await;
+        let result = self
+            .run_until_done(server_id, &running, ready, query, sleep, asleep)
+            .await;
         self.servers.lock().unwrap().remove(server_id);
         if let Err(e) = &result {
             self.state(server_id, ServerStatus::Crashed, Some(format!("{e:#}")));
@@ -306,16 +350,40 @@ impl Runtime {
     async fn run_until_done(
         self: &Arc<Self>,
         server_id: &str,
-        running: &Running,
+        running: &Arc<Running>,
         ready: Option<Regex>,
         query: Option<QuerySpec>,
+        sleep: Option<SleepSpec>,
+        mut asleep: bool,
     ) -> anyhow::Result<()> {
         let name = container_name(server_id);
+        let idle = sleep
+            .as_ref()
+            .map(|s| Duration::from_secs(u64::from(s.idle_minutes.max(1)) * 60));
         let mut attempts = 0;
         loop {
+            if asleep {
+                if !self
+                    .sleep_until_woken(server_id, running, sleep.as_ref())
+                    .await
+                {
+                    self.state(server_id, ServerStatus::Stopped, None);
+                    return Ok(());
+                }
+                info!("Waking {server_id}");
+                running.sleeping.store(false, Ordering::SeqCst);
+                attempts = 0;
+                self.state(server_id, ServerStatus::Starting, None);
+                self.docker
+                    .start_container(&name, None)
+                    .await
+                    .context("Waking the container")?;
+            }
+            asleep = false;
+
             let since = Instant::now();
             let became_ready = self
-                .run_once(server_id, running, ready.clone(), query.clone())
+                .run_once(server_id, running, ready.clone(), query.clone(), idle)
                 .await?;
 
             let exit = self
@@ -329,7 +397,16 @@ impl Runtime {
                 Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
                 _ => -1,
             };
-            if running.stopping.load(Ordering::SeqCst) || code == 0 {
+            if running.stopping.load(Ordering::SeqCst) {
+                info!("Server {server_id} stopped");
+                self.state(server_id, ServerStatus::Stopped, None);
+                return Ok(());
+            }
+            if running.sleeping.load(Ordering::SeqCst) {
+                asleep = true;
+                continue;
+            }
+            if code == 0 {
                 info!("Server {server_id} stopped");
                 self.state(server_id, ServerStatus::Stopped, None);
                 return Ok(());
@@ -394,9 +471,10 @@ impl Runtime {
     async fn run_once(
         self: &Arc<Self>,
         server_id: &str,
-        running: &Running,
+        running: &Arc<Running>,
         mut ready: Option<Regex>,
         query: Option<QuerySpec>,
+        idle: Option<Duration>,
     ) -> anyhow::Result<bool> {
         let attach = self
             .docker
@@ -417,8 +495,12 @@ impl Runtime {
         }
 
         let stats = tokio::spawn(self.clone().stream_stats(server_id.to_string()));
-        let players =
-            query.map(|q| tokio::spawn(self.clone().poll_players(server_id.to_string(), q)));
+        let players = query.map(|q| {
+            tokio::spawn(
+                self.clone()
+                    .poll_players(server_id.to_string(), q, running.clone(), idle),
+            )
+        });
 
         let mut output = attach.output;
         let mut tail = String::new(); // last partial line, so the ready pattern also matches across chunks
@@ -495,23 +577,109 @@ impl Runtime {
     }
 
     /// Asks the server who is online. Failures are expected while it starts and are not reported.
-    async fn poll_players(self: Arc<Self>, server_id: String, query: QuerySpec) {
+    /// With `idle`, a server nobody was on for that long is put to sleep (ADR 0013).
+    async fn poll_players(
+        self: Arc<Self>,
+        server_id: String,
+        query: QuerySpec,
+        running: Arc<Running>,
+        idle: Option<Duration>,
+    ) {
         let mut tick = tokio::time::interval(PLAYERS_INTERVAL);
+        let mut empty_since: Option<Instant> = None;
         loop {
             tick.tick().await;
             let result = match query.protocol {
                 QueryProtocol::Minecraft => query::minecraft(query.port).await,
                 QueryProtocol::Unsupported => return,
             };
-            if let Ok(players) = result {
-                self.emit(AgentMessage::ServerPlayers(ServerPlayers {
-                    server_id: server_id.clone(),
-                    online: players.online,
-                    max: players.max,
-                    names: players.names,
-                }));
+            let Ok(players) = result else { continue };
+            let online = players.online;
+            self.emit(AgentMessage::ServerPlayers(ServerPlayers {
+                server_id: server_id.clone(),
+                online,
+                max: players.max,
+                names: players.names,
+            }));
+            let Some(idle) = idle else { continue };
+            if online > 0 {
+                empty_since = None;
+            } else if empty_since.get_or_insert_with(Instant::now).elapsed() >= idle
+                && !running.stopping.load(Ordering::SeqCst)
+                && !running.sleeping.swap(true, Ordering::SeqCst)
+            {
+                info!("Nobody online on {server_id}, going to sleep");
+                self.state(
+                    &server_id,
+                    ServerStatus::Stopping,
+                    Some("Going to sleep: nobody online".into()),
+                );
+                // In its own task: this one ends when the container's output does.
+                let this = self.clone();
+                let timeout = running.stop_timeout_secs;
+                tokio::spawn(async move {
+                    let options = StopContainerOptions {
+                        t: Some(timeout),
+                        ..Default::default()
+                    };
+                    let name = container_name(&server_id);
+                    if let Err(e) = this.docker.stop_container(&name, Some(options)).await {
+                        warn!("Putting {server_id} to sleep failed: {e:#}");
+                    }
+                });
+                return;
             }
         }
+    }
+
+    fn sleep_marker(&self, server_id: &str) -> PathBuf {
+        self.data_dir.join(SLEEPING_DIR).join(server_id)
+    }
+
+    /// Waits while the server sleeps (ADR 0013): answers on its game port if the spec says how,
+    /// until a player joins or the panel starts or stops it. Returns false if it was stopped.
+    async fn sleep_until_woken(
+        &self,
+        server_id: &str,
+        running: &Running,
+        sleep: Option<&SleepSpec>,
+    ) -> bool {
+        let marker = self.sleep_marker(server_id);
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, "");
+
+        let wake = sleep
+            .and_then(|s| s.wake.as_ref())
+            .filter(|w| w.protocol == WakeProtocol::Minecraft);
+        let listener = match wake {
+            Some(w) => match TcpListener::bind(("0.0.0.0", w.port)).await {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    warn!("Waking {server_id} on connect is not available: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        let message = (wake.is_some() && listener.is_none())
+            .then(|| "Waking on connect is not available: the game port is in use".to_string());
+        info!("Server {server_id} sleeps");
+        self.state(server_id, ServerStatus::Sleeping, message);
+
+        match (&listener, wake) {
+            (Some(listener), Some(w)) => tokio::select! {
+                () = running.wake.notified() => {}
+                () = wake::minecraft(listener, &w.status_text, &w.join_text) => {
+                    info!("A player woke {server_id}");
+                }
+            },
+            _ => running.wake.notified().await,
+        }
+        drop(listener); // frees the port for the container
+        let _ = std::fs::remove_file(&marker);
+        !running.stopping.load(Ordering::SeqCst)
     }
 
     /// Stops gracefully: Docker sends SIGTERM and kills the process after the timeout.
