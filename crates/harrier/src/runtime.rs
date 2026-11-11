@@ -68,7 +68,8 @@ struct Running {
     sleeping: AtomicBool,
     /// Ends a pending restart or a sleep: the server was stopped or started from the panel.
     wake: Notify,
-    /// Console output for whoever waits for a line, like a backup for "Saved the game".
+    /// Whole console lines (see `Lines`) for whoever waits for one, like a backup for
+    /// "Saved the game". Subscribers only ever get complete lines, so they never start mid-line.
     output: broadcast::Sender<String>,
     stop_timeout_secs: i32,
 }
@@ -87,16 +88,15 @@ pub struct Runtime {
     token: String,
 }
 
-/// Finds a pattern in console output, one complete line at a time. Console output is untrusted:
-/// players can write anything into chat, so a pattern only counts if it matches a whole line
-/// (templates anchor theirs to the game's own log lines). Text is only treated as the start of a
-/// line after a line break this reader saw itself: never the rest of a line it joined in the
-/// middle of, or the rest of a line too long to keep.
-#[derive(Default)]
+/// Cuts console output into whole lines. Console output is untrusted: players can write anything
+/// into chat, so patterns are only matched against whole lines (templates anchor theirs to the
+/// game's own log lines). A reader only trusts a line start after a line break it saw itself:
+/// the first line after attaching may be the end of an older one, and so is the rest of a line
+/// that was too long to keep.
 struct Lines {
     /// The last, incomplete line.
     tail: String,
-    /// Skip everything up to the next line break: the reader is not at a line start.
+    /// Skip everything up to the next line break: not at a line start.
     resync: bool,
 }
 
@@ -104,33 +104,35 @@ impl Lines {
     /// A line longer than this is dropped instead of growing without end.
     const MAX: usize = 64 * 1024;
 
-    /// For output that is already flowing, e.g. a backup that starts listening to a running server.
-    fn mid_stream() -> Self {
+    /// For a stream joined at an unknown point, like an attach to a container.
+    fn new() -> Self {
         Self {
             tail: String::new(),
             resync: true,
         }
     }
 
-    /// Adds output; returns whether a complete line matched.
-    fn feed(&mut self, chunk: &str, pattern: &Regex) -> bool {
+    /// Adds output; returns the lines it completed, without line break and colour codes.
+    fn push(&mut self, chunk: &str) -> Vec<String> {
         static ANSI: std::sync::LazyLock<Regex> =
             std::sync::LazyLock::new(|| Regex::new("\\x1b\\[[0-9;?]*[A-Za-z]").unwrap());
         self.tail.push_str(chunk);
-        let mut found = false;
+        let mut lines = Vec::new();
         while let Some(end) = self.tail.find('\n') {
             let line: String = self.tail.drain(..=end).collect();
             if std::mem::take(&mut self.resync) {
-                continue; // the end of a line whose start this reader did not see
+                continue; // the end of a line whose start was not seen
             }
-            let line = ANSI.replace_all(line.trim_end_matches(['\n', '\r']), "");
-            found |= pattern.is_match(&line);
+            lines.push(
+                ANSI.replace_all(line.trim_end_matches(['\n', '\r']), "")
+                    .into_owned(),
+            );
         }
         if self.tail.len() > Self::MAX {
             self.tail.clear();
             self.resync = true;
         }
-        found
+        lines
     }
 }
 
@@ -567,17 +569,21 @@ impl Runtime {
         });
 
         let mut output = attach.output;
-        let mut lines = Lines::default();
+        // Attached to an already running output stream: the first line may be cut off.
+        let mut lines = Lines::new();
         while let Some(chunk) = output.next().await {
             let Ok(chunk) = chunk else { break };
             let data = String::from_utf8_lossy(&chunk.into_bytes()).into_owned();
-            if let Some(pattern) = &ready
-                && lines.feed(&data, pattern)
-            {
-                self.state(server_id, ServerStatus::Running, None);
-                ready = None;
+            for line in lines.push(&data) {
+                if ready
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(&line))
+                {
+                    self.state(server_id, ServerStatus::Running, None);
+                    ready = None;
+                }
+                let _ = running.output.send(line);
             }
-            let _ = running.output.send(data.clone());
             self.emit(AgentMessage::ConsoleOutput(ConsoleOutput {
                 server_id: server_id.to_string(),
                 data,
@@ -1046,11 +1052,9 @@ impl Runtime {
                 .await;
         }
         let Some(ready) = ready else { return Ok(()) };
-        // Subscribed while output flows: the first line may be the end of someone's chat line.
-        let mut lines = Lines::mid_stream();
         tokio::time::timeout(Duration::from_secs(60), async {
-            while let Ok(chunk) = output.recv().await {
-                if lines.feed(&chunk, &ready) {
+            while let Ok(line) = output.recv().await {
+                if ready.is_match(&line) {
                     return true;
                 }
             }
@@ -1134,48 +1138,28 @@ mod tests {
             r"^\[[0-9:]{8}(\] \[Server thread/INFO\]| INFO\]): (System chat: )?Saved the game$",
         )
         .unwrap();
-        let mut lines = Lines::default();
-        assert!(!lines.feed(
-            "[12:00:00] [Server thread/INFO]: <Griefer> Saved the game\n",
-            &saved
+        let system = "[12:00:00] [Server thread/INFO]: System chat: Saved the game\n";
+        let mut lines = Lines::new();
+        let mut matches = |chunk: &str| lines.push(chunk).iter().any(|l| saved.is_match(l));
+
+        // Attached mid-stream: the first line may be the end of a chat line, so it never counts.
+        assert!(!matches(system));
+        assert!(!matches(
+            "[12:00:01] [Server thread/INFO]: <Griefer> Saved the game\n"
         ));
-        assert!(!lines.feed(
-            "[12:00:01] [Server thread/INFO]: <Griefer> x\n]: Saved the game",
-            &saved
+        assert!(!matches(
+            "[12:00:02] [Server thread/INFO]: <Griefer> INFO]: Saved the game\n"
         ));
-        assert!(
-            !lines.feed("\n", &saved),
-            "chat text on its own line has no INFO prefix"
-        );
         // Split over chunks, with a colour code and \r\n from the terminal.
-        assert!(!lines.feed(
-            "\x1b[0m[12:00:02] [Server thread/INFO]: System chat: Saved",
-            &saved
+        assert!(!matches(
+            "\x1b[0m[12:00:03] [Server thread/INFO]: System chat: Saved"
         ));
-        assert!(lines.feed(" the game\x1b[0m\r\n", &saved));
+        assert!(matches(" the game\x1b[0m\r\n"));
 
         // A line that never ends is dropped, and so is the rest of it once its end arrives.
-        lines.feed(&"x".repeat(Lines::MAX + 1), &saved);
-        assert!(lines.tail.is_empty());
-        assert!(!lines.feed(
-            "[12:00:03] [Server thread/INFO]: System chat: Saved the game\n",
-            &saved
-        ));
-        assert!(lines.feed(
-            "[12:00:04] [Server thread/INFO]: System chat: Saved the game\n",
-            &saved
-        ));
-
-        // Joining mid-line: the first piece is the end of a line whose start was not seen.
-        let mut joined = Lines::mid_stream();
-        assert!(!joined.feed(
-            "[12:00:05] [Server thread/INFO]: System chat: Saved the game\n",
-            &saved
-        ));
-        assert!(joined.feed(
-            "[12:00:06] [Server thread/INFO]: System chat: Saved the game\n",
-            &saved
-        ));
+        assert!(!matches(&"x".repeat(Lines::MAX + 1)));
+        assert!(!matches(system));
+        assert!(matches(system));
     }
 
     #[test]
