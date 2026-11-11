@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/harrier-gg/agent/compare/v0.3.0...v0.4.0) (2026-11-11)
+
+
+### Features
+
+* sleep when nobody is online and wake Minecraft servers on connect ([#12](https://github.com/harrier-gg/agent/issues/12)) ([51b9376](https://github.com/harrier-gg/agent/commit/51b9376c7f7667952859e4a87d9eff57478dbf43))
+
 ## [0.3.0](https://github.com/harrier-gg/agent/compare/v0.2.0...v0.3.0) (2026-11-11)
 
 
