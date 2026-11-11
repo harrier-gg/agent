@@ -68,7 +68,8 @@ struct Running {
     sleeping: AtomicBool,
     /// Ends a pending restart or a sleep: the server was stopped or started from the panel.
     wake: Notify,
-    /// Console output for whoever waits for a line, like a backup for "Saved the game".
+    /// Whole console lines (see `Lines`) for whoever waits for one, like a backup for
+    /// "Saved the game". Subscribers only ever get complete lines, so they never start mid-line.
     output: broadcast::Sender<String>,
     stop_timeout_secs: i32,
 }
@@ -85,6 +86,54 @@ pub struct Runtime {
     /// Panel URL and agent token, for transfer channels (ADR 0015).
     panel: String,
     token: String,
+}
+
+/// Cuts console output into whole lines. Console output is untrusted: players can write anything
+/// into chat, so patterns are only matched against whole lines (templates anchor theirs to the
+/// game's own log lines). A reader only trusts a line start after a line break it saw itself:
+/// the first line after attaching may be the end of an older one, and so is the rest of a line
+/// that was too long to keep.
+struct Lines {
+    /// The last, incomplete line.
+    tail: String,
+    /// Skip everything up to the next line break: not at a line start.
+    resync: bool,
+}
+
+impl Lines {
+    /// A line longer than this is dropped instead of growing without end.
+    const MAX: usize = 64 * 1024;
+
+    /// For a stream joined at an unknown point, like an attach to a container.
+    fn new() -> Self {
+        Self {
+            tail: String::new(),
+            resync: true,
+        }
+    }
+
+    /// Adds output; returns the lines it completed, without line break and colour codes.
+    fn push(&mut self, chunk: &str) -> Vec<String> {
+        static ANSI: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new("\\x1b\\[[0-9;?]*[A-Za-z]").unwrap());
+        self.tail.push_str(chunk);
+        let mut lines = Vec::new();
+        while let Some(end) = self.tail.find('\n') {
+            let line: String = self.tail.drain(..=end).collect();
+            if std::mem::take(&mut self.resync) {
+                continue; // the end of a line whose start was not seen
+            }
+            lines.push(
+                ANSI.replace_all(line.trim_end_matches(['\n', '\r']), "")
+                    .into_owned(),
+            );
+        }
+        if self.tail.len() > Self::MAX {
+            self.tail.clear();
+            self.resync = true;
+        }
+        lines
+    }
 }
 
 fn container_name(server_id: &str) -> String {
@@ -520,21 +569,21 @@ impl Runtime {
         });
 
         let mut output = attach.output;
-        let mut tail = String::new(); // last partial line, so the ready pattern also matches across chunks
+        // Attached to an already running output stream: the first line may be cut off.
+        let mut lines = Lines::new();
         while let Some(chunk) = output.next().await {
             let Ok(chunk) = chunk else { break };
             let data = String::from_utf8_lossy(&chunk.into_bytes()).into_owned();
-            if let Some(pattern) = &ready {
-                tail.push_str(&data);
-                if pattern.is_match(&tail) {
+            for line in lines.push(&data) {
+                if ready
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(&line))
+                {
                     self.state(server_id, ServerStatus::Running, None);
                     ready = None;
                 }
-                if let Some(pos) = tail.rfind('\n') {
-                    tail.drain(..=pos);
-                }
+                let _ = running.output.send(line);
             }
-            let _ = running.output.send(data.clone());
             self.emit(AgentMessage::ConsoleOutput(ConsoleOutput {
                 server_id: server_id.to_string(),
                 data,
@@ -1003,15 +1052,10 @@ impl Runtime {
                 .await;
         }
         let Some(ready) = ready else { return Ok(()) };
-        let mut tail = String::new();
         tokio::time::timeout(Duration::from_secs(60), async {
-            while let Ok(chunk) = output.recv().await {
-                tail.push_str(&chunk);
-                if ready.is_match(&tail) {
+            while let Ok(line) = output.recv().await {
+                if ready.is_match(&line) {
                     return true;
-                }
-                if let Some(pos) = tail.rfind('\n') {
-                    tail.drain(..=pos);
                 }
             }
             false
@@ -1086,6 +1130,37 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_patterns_match_whole_lines_only() {
+        // The Minecraft template's pattern: the game's own line, not a player's chat.
+        let saved = Regex::new(
+            r"^\[[0-9:]{8}(\] \[Server thread/INFO\]| INFO\]): (System chat: )?Saved the game$",
+        )
+        .unwrap();
+        let system = "[12:00:00] [Server thread/INFO]: System chat: Saved the game\n";
+        let mut lines = Lines::new();
+        let mut matches = |chunk: &str| lines.push(chunk).iter().any(|l| saved.is_match(l));
+
+        // Attached mid-stream: the first line may be the end of a chat line, so it never counts.
+        assert!(!matches(system));
+        assert!(!matches(
+            "[12:00:01] [Server thread/INFO]: <Griefer> Saved the game\n"
+        ));
+        assert!(!matches(
+            "[12:00:02] [Server thread/INFO]: <Griefer> INFO]: Saved the game\n"
+        ));
+        // Split over chunks, with a colour code and \r\n from the terminal.
+        assert!(!matches(
+            "\x1b[0m[12:00:03] [Server thread/INFO]: System chat: Saved"
+        ));
+        assert!(matches(" the game\x1b[0m\r\n"));
+
+        // A line that never ends is dropped, and so is the rest of it once its end arrives.
+        assert!(!matches(&"x".repeat(Lines::MAX + 1)));
+        assert!(!matches(system));
+        assert!(matches(system));
+    }
 
     #[test]
     fn restarts_ready_servers_three_times_with_growing_delays() {
