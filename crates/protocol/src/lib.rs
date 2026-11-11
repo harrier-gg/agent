@@ -62,6 +62,72 @@ pub enum PanelMessage {
     ReadFile(ReadFile),
     /// Replace a text file in a server's data directory (ADR 0011). Answered with `fileResult`.
     WriteFile(WriteFile),
+    /// List a directory; `path` "" is the data directory itself (ADR 0015). Answered with
+    /// `fileResult` and `entries`.
+    ListDir(PathRequest),
+    /// Delete a file, or a directory with everything in it (ADR 0015).
+    DeletePath(PathRequest),
+    /// Create a directory and missing parents (ADR 0015).
+    MakeDir(PathRequest),
+    /// Rename or move inside the data directory; fails if the target exists (ADR 0015).
+    MovePath(MovePath),
+    /// Stream a file to the panel over the transfer channel `/agent/transfer/<transferId>`.
+    SendFile(Transfer),
+    /// Receive a file from the panel over the transfer channel and put it at `path`.
+    ReceiveFile(Transfer),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PathRequest {
+    pub request_id: String,
+    pub server_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MovePath {
+    pub request_id: String,
+    pub server_id: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// A file transfer (ADR 0015). The agent opens `<panel>/agent/transfer/<transferId>` with its
+/// token and streams binary frames; it closes normally when done, or with code 1011 and a reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Transfer {
+    pub transfer_id: String,
+    pub server_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileEntry {
+    pub name: String,
+    pub kind: EntryKind,
+    #[ts(type = "number")]
+    pub size: u64,
+    /// Last change, seconds since 1970.
+    #[ts(type = "number | null")]
+    pub modified: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum EntryKind {
+    File,
+    Dir,
+    /// Symlinks and special files; shown, but not opened.
+    Other,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -95,6 +161,9 @@ pub struct FileResult {
     /// Why the request failed (English); `null` on success.
     #[serde(default)]
     pub error: Option<String>,
+    /// The directory's entries for `listDir`, directories first.
+    #[serde(default)]
+    pub entries: Option<Vec<FileEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
