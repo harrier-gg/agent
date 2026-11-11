@@ -11,7 +11,7 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, ConsoleOutput, PortProtocol, QueryProtocol, QuerySpec, RuntimeSpec,
+    AgentMessage, ConsoleOutput, PortProtocol, QueryProtocol, QuerySpec, Restart, RuntimeSpec,
     ServerPlayers, ServerState, ServerStats, ServerStatus,
 };
 use regex::Regex;
@@ -23,21 +23,40 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{info, warn};
 
 const LABEL: &str = "gg.harrier.server";
 /// The spec's `query`, kept on the container so a restarted agent keeps asking (ADR 0009).
 const QUERY_LABEL: &str = "gg.harrier.query";
-const PLAYERS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const PLAYERS_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_STOP_TIMEOUT_SECS: i32 = 30;
+/// Waits before restarting a crashed server; its length is the number of attempts (ADR 0010).
+const RESTART_DELAYS_SECS: [u64; 3] = [10, 30, 60];
+/// A server that ran this long without crashing counts restarts from zero again.
+const STABLE_AFTER: Duration = Duration::from_secs(600);
+
+/// How long to wait before restarting a crashed server, or `None` to leave it crashed.
+/// A server that crashed before it became ready most likely has a problem a restart won't fix.
+fn restart_delay(became_ready: bool, attempts: usize) -> Option<Duration> {
+    if !became_ready {
+        return None;
+    }
+    RESTART_DELAYS_SECS
+        .get(attempts)
+        .map(|s| Duration::from_secs(*s))
+}
 
 type Stdin = Pin<Box<dyn AsyncWrite + Send>>;
 
 struct Running {
-    stdin: tokio::sync::Mutex<Stdin>,
+    /// Replaced after every restart.
+    stdin: tokio::sync::Mutex<Option<Stdin>>,
     stopping: AtomicBool,
+    /// Wakes a pending restart, so stopping does not wait for it.
+    wake: Notify,
     stop_timeout_secs: i32,
 }
 
@@ -76,6 +95,7 @@ impl Runtime {
             server_id: server_id.into(),
             status,
             message,
+            restart: None,
         }));
     }
 
@@ -105,8 +125,12 @@ impl Runtime {
                 container.state,
                 Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
             );
+            let known = self.servers.lock().unwrap().contains_key(&server_id);
             if !running {
-                self.state(&server_id, ServerStatus::Stopped, None);
+                // A known server that is not running waits for a restart and reports itself.
+                if !known {
+                    self.state(&server_id, ServerStatus::Stopped, None);
+                }
                 continue;
             }
             let query = container
@@ -114,7 +138,6 @@ impl Runtime {
                 .as_ref()
                 .and_then(|l| l.get(QUERY_LABEL))
                 .and_then(|q| serde_json::from_str::<QuerySpec>(q).ok());
-            let known = self.servers.lock().unwrap().contains_key(&server_id);
             if known {
                 self.state(&server_id, ServerStatus::Running, None);
             } else {
@@ -254,6 +277,7 @@ impl Runtime {
     }
 
     /// Streams console output and stats until the container exits, then reports the result.
+    /// Restarts crashed servers (ADR 0010) until they stop, keep crashing or are stopped.
     async fn supervise(
         self: Arc<Self>,
         server_id: &str,
@@ -261,11 +285,123 @@ impl Runtime {
         stop_timeout_secs: i32,
         query: Option<QuerySpec>,
     ) -> anyhow::Result<()> {
+        let running = Arc::new(Running {
+            stdin: tokio::sync::Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            wake: Notify::new(),
+            stop_timeout_secs,
+        });
+        self.servers
+            .lock()
+            .unwrap()
+            .insert(server_id.to_string(), running.clone());
+        let result = self.run_until_done(server_id, &running, ready, query).await;
+        self.servers.lock().unwrap().remove(server_id);
+        if let Err(e) = &result {
+            self.state(server_id, ServerStatus::Crashed, Some(format!("{e:#}")));
+        }
+        result
+    }
+
+    async fn run_until_done(
+        self: &Arc<Self>,
+        server_id: &str,
+        running: &Running,
+        ready: Option<Regex>,
+        query: Option<QuerySpec>,
+    ) -> anyhow::Result<()> {
         let name = container_name(server_id);
+        let mut attempts = 0;
+        loop {
+            let since = Instant::now();
+            let became_ready = self
+                .run_once(server_id, running, ready.clone(), query.clone())
+                .await?;
+
+            let exit = self
+                .docker
+                .wait_container(&name, None::<WaitContainerOptions>)
+                .next()
+                .await;
+            let code = match exit {
+                Some(Ok(r)) => r.status_code,
+                // bollard reports a non-zero exit code as an error
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+                _ => -1,
+            };
+            if running.stopping.load(Ordering::SeqCst) || code == 0 {
+                info!("Server {server_id} stopped");
+                self.state(server_id, ServerStatus::Stopped, None);
+                return Ok(());
+            }
+
+            let oom = self
+                .docker
+                .inspect_container(&name, None)
+                .await
+                .ok()
+                .and_then(|c| c.state)
+                .and_then(|s| s.oom_killed)
+                .unwrap_or(false);
+            let reason = if oom {
+                "Out of memory: killed at its memory limit".to_string()
+            } else {
+                format!("Exited with code {code}")
+            };
+            warn!("Server {server_id}: {reason}");
+            if since.elapsed() >= STABLE_AFTER {
+                attempts = 0;
+            }
+            let Some(delay) = restart_delay(became_ready, attempts) else {
+                let message = if attempts > 0 {
+                    format!("{reason}; not restarted again after {attempts} attempts")
+                } else {
+                    reason
+                };
+                self.state(server_id, ServerStatus::Crashed, Some(message));
+                return Ok(());
+            };
+
+            attempts += 1;
+            self.emit(AgentMessage::ServerState(ServerState {
+                server_id: server_id.into(),
+                status: ServerStatus::Crashed,
+                message: Some(reason),
+                restart: Some(Restart {
+                    attempt: attempts as u32,
+                    max_attempts: RESTART_DELAYS_SECS.len() as u32,
+                }),
+            }));
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = running.wake.notified() => {}
+            }
+            if running.stopping.load(Ordering::SeqCst) {
+                self.state(server_id, ServerStatus::Stopped, None);
+                return Ok(());
+            }
+            info!("Restarting {server_id} (attempt {attempts})");
+            self.state(server_id, ServerStatus::Starting, None);
+            self.docker
+                .start_container(&name, None)
+                .await
+                .context("Restarting the container")?;
+        }
+    }
+
+    /// Attaches to the started container and streams its output, stats and players until it
+    /// exits. Returns whether the server became ready.
+    async fn run_once(
+        self: &Arc<Self>,
+        server_id: &str,
+        running: &Running,
+        mut ready: Option<Regex>,
+        query: Option<QuerySpec>,
+    ) -> anyhow::Result<bool> {
         let attach = self
             .docker
             .attach_container(
-                &name,
+                &container_name(server_id),
                 Some(AttachContainerOptions {
                     stdin: true,
                     stdout: true,
@@ -275,16 +411,7 @@ impl Runtime {
                 }),
             )
             .await?;
-
-        let running = Arc::new(Running {
-            stdin: tokio::sync::Mutex::new(attach.input),
-            stopping: AtomicBool::new(false),
-            stop_timeout_secs,
-        });
-        self.servers
-            .lock()
-            .unwrap()
-            .insert(server_id.to_string(), running.clone());
+        *running.stdin.lock().await = Some(attach.input);
         if ready.is_none() {
             self.state(server_id, ServerStatus::Running, None);
         }
@@ -294,7 +421,6 @@ impl Runtime {
             query.map(|q| tokio::spawn(self.clone().poll_players(server_id.to_string(), q)));
 
         let mut output = attach.output;
-        let mut ready = ready;
         let mut tail = String::new(); // last partial line, so the ready pattern also matches across chunks
         while let Some(chunk) = output.next().await {
             let Ok(chunk) = chunk else { break };
@@ -314,36 +440,11 @@ impl Runtime {
                 data,
             }));
         }
-
-        let exit = self
-            .docker
-            .wait_container(&name, None::<WaitContainerOptions>)
-            .next()
-            .await;
         stats.abort();
         if let Some(players) = players {
             players.abort();
         }
-        self.servers.lock().unwrap().remove(server_id);
-
-        let code = match exit {
-            Some(Ok(r)) => r.status_code,
-            // bollard reports a non-zero exit code as an error
-            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
-            _ => -1,
-        };
-        if running.stopping.load(Ordering::SeqCst) || code == 0 {
-            info!("Server {server_id} stopped");
-            self.state(server_id, ServerStatus::Stopped, None);
-        } else {
-            warn!("Server {server_id} exited with code {code}");
-            self.state(
-                server_id,
-                ServerStatus::Crashed,
-                Some(format!("Exited with code {code}")),
-            );
-        }
-        Ok(())
+        Ok(ready.is_none())
     }
 
     async fn stream_stats(self: Arc<Self>, server_id: String) {
@@ -421,6 +522,7 @@ impl Runtime {
             return;
         };
         running.stopping.store(true, Ordering::SeqCst);
+        running.wake.notify_one();
         self.state(&server_id, ServerStatus::Stopping, None);
         let options = StopContainerOptions {
             t: Some(running.stop_timeout_secs),
@@ -445,8 +547,28 @@ impl Runtime {
         };
         let line: String = command.chars().filter(|c| !c.is_control()).collect();
         let mut stdin = running.stdin.lock().await;
+        let Some(stdin) = stdin.as_mut() else { return };
         if let Err(e) = stdin.write_all(format!("{line}\n").as_bytes()).await {
             warn!("Writing to the console of {server_id} failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarts_ready_servers_three_times_with_growing_delays() {
+        let delays: Vec<_> = (0..4).map(|a| restart_delay(true, a)).collect();
+        assert_eq!(
+            delays,
+            [10, 30, 60]
+                .map(|s| Some(Duration::from_secs(s)))
+                .into_iter()
+                .chain([None])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(restart_delay(false, 0), None);
     }
 }
