@@ -2,6 +2,7 @@
 //! `harrier agent run` connects to the panel and authenticates with the node's agent token.
 
 mod agent;
+mod runtime;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -41,6 +42,11 @@ enum AgentCommand {
         /// the home network without HTTPS. Anyone on that network can read the token.
         #[arg(long, env = "HARRIER_AGENT_INSECURE")]
         insecure: bool,
+
+        /// Directory for the servers' data (worlds, configs, mods); one subdirectory per server.
+        /// Default: ~/.local/share/harrier/servers
+        #[arg(long, env = "HARRIER_DATA_DIR")]
+        data_dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -54,11 +60,21 @@ async fn main() -> anyhow::Result<()> {
 
     match Cli::parse().command {
         Command::Agent {
-            command: AgentCommand::Run { panel, insecure },
+            command:
+                AgentCommand::Run {
+                    panel,
+                    insecure,
+                    data_dir,
+                },
         } => {
             let token = agent_token()?;
             check_panel_url(&panel, insecure)?;
-            agent::run(&panel, &token).await
+            let data_dir = match data_dir {
+                Some(dir) => dir,
+                None => std::path::PathBuf::from(std::env::var("HOME")?)
+                    .join(".local/share/harrier/servers"),
+            };
+            agent::run(&panel, &token, data_dir).await
         }
     }
 }

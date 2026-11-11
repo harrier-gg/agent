@@ -1,7 +1,11 @@
+use crate::runtime::Runtime;
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use harrier_protocol::{AgentMessage, Hello, PROTOCOL_VERSION, PanelMessage};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
@@ -18,11 +22,15 @@ const CLOSE_REPLACED: u16 = 4002;
 ///
 /// The token authenticates the node (ADR 0004). It is sent in the `Authorization` header of the
 /// WebSocket upgrade and never logged.
-pub async fn run(panel: &str, token: &str) -> anyhow::Result<()> {
+pub async fn run(panel: &str, token: &str, data_dir: PathBuf) -> anyhow::Result<()> {
+    // The runtime and its event channel outlive single connections: servers keep running
+    // while the agent reconnects.
+    let (events_tx, mut events) = mpsc::channel(1024);
+    let runtime = Runtime::new(data_dir, events_tx)?;
     let mut backoff = Duration::from_secs(1);
     loop {
         tokio::select! {
-            result = session(panel, token) => match result {
+            result = session(panel, token, &runtime, &mut events) => match result {
                 Ok(Outcome::Rejected(reason)) => {
                     error!("The panel rejected this agent: {reason}");
                     std::process::exit(2);
@@ -49,7 +57,12 @@ enum Outcome {
     Rejected(String),
 }
 
-async fn session(panel: &str, token: &str) -> anyhow::Result<Outcome> {
+async fn session(
+    panel: &str,
+    token: &str,
+    runtime: &Arc<Runtime>,
+    events: &mut mpsc::Receiver<AgentMessage>,
+) -> anyhow::Result<Outcome> {
     let mut request = panel
         .into_client_request()
         .with_context(|| format!("Invalid panel URL {panel}"))?;
@@ -77,8 +90,23 @@ async fn session(panel: &str, token: &str) -> anyhow::Result<Outcome> {
     ws.send(Message::text(serde_json::to_string(&hello)?))
         .await?;
 
-    while let Some(msg) = ws.next().await {
-        let text = match msg? {
+    // Events collected while disconnected are stale; the current state is reported after welcome.
+    while events.try_recv().is_ok() {}
+
+    loop {
+        let msg = tokio::select! {
+            msg = ws.next() => match msg {
+                Some(msg) => msg?,
+                None => break,
+            },
+            event = events.recv() => {
+                if let Some(event) = event {
+                    ws.send(Message::text(serde_json::to_string(&event)?)).await?;
+                }
+                continue;
+            }
+        };
+        let text = match msg {
             Message::Text(text) => text,
             Message::Close(Some(frame)) if u16::from(frame.code) == CLOSE_REPLACED => {
                 return Ok(Outcome::Rejected(
@@ -88,18 +116,36 @@ async fn session(panel: &str, token: &str) -> anyhow::Result<Outcome> {
             }
             _ => continue,
         };
-        match serde_json::from_str::<PanelMessage>(&text)? {
+        // Unknown message types come from a newer panel; ignoring them keeps the agent working
+        // (ADR 0002).
+        let Ok(message) = serde_json::from_str::<PanelMessage>(&text) else {
+            warn!("Ignoring a message the agent does not understand");
+            continue;
+        };
+        match message {
             PanelMessage::Welcome(w) => {
                 info!(
                     "Connected to the panel as {} (protocol {})",
                     w.agent_id, w.protocol
-                )
+                );
+                if let Err(e) = runtime.report_all().await {
+                    warn!("Reporting servers failed (is Docker running?): {e:#}");
+                }
             }
             PanelMessage::Reject(r) => {
                 return Ok(Outcome::Rejected(format!(
                     "{} (panel supports protocol {}–{}, agent speaks {PROTOCOL_VERSION})",
                     r.reason, r.min_protocol, r.max_protocol
                 )));
+            }
+            PanelMessage::StartServer(start) => {
+                tokio::spawn(runtime.clone().start(start.server_id, start.spec));
+            }
+            PanelMessage::StopServer(stop) => {
+                tokio::spawn(runtime.clone().stop(stop.server_id));
+            }
+            PanelMessage::SendCommand(cmd) => {
+                tokio::spawn(runtime.clone().send_command(cmd.server_id, cmd.command));
             }
         }
     }
