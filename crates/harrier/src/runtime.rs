@@ -1,7 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
-use crate::{files, query, transfer, wake};
+use crate::{backup, files, query, transfer, wake};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -11,12 +11,13 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, ConsoleOutput, FileEntry, FileResult, MovePath, PathRequest, PortProtocol,
-    QueryProtocol, QuerySpec, ReadFile, Restart, RuntimeSpec, ServerPlayers, ServerState,
-    ServerStats, ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
+    AgentMessage, BackupAction, BackupRef, BackupResult, ConsoleOutput, CreateBackup, FileEntry,
+    FileResult, MovePath, PathRequest, PortProtocol, QueryProtocol, QuerySpec, Quiesce, ReadFile,
+    Restart, RestoreBackup, RuntimeSpec, ServerPlayers, ServerRequest, ServerState, ServerStats,
+    ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
 };
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 // ponytail: Unix only (container user = owner of the data directory); Windows agents come with
 // `runtime: native` (ADR 0005)
 use std::os::unix::fs::MetadataExt;
@@ -27,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tracing::{info, warn};
 
 const LABEL: &str = "gg.harrier.server";
@@ -67,6 +68,8 @@ struct Running {
     sleeping: AtomicBool,
     /// Ends a pending restart or a sleep: the server was stopped or started from the panel.
     wake: Notify,
+    /// Console output for whoever waits for a line, like a backup for "Saved the game".
+    output: broadcast::Sender<String>,
     stop_timeout_secs: i32,
 }
 
@@ -77,6 +80,8 @@ pub struct Runtime {
     data_dir: PathBuf,
     events: mpsc::Sender<AgentMessage>,
     servers: Mutex<HashMap<String, Arc<Running>>>,
+    /// Servers with a backup or restore in progress; one at a time per server (ADR 0016).
+    backing_up: Mutex<HashSet<String>>,
     /// Panel URL and agent token, for transfer channels (ADR 0015).
     panel: String,
     token: String,
@@ -99,6 +104,7 @@ impl Runtime {
             data_dir,
             events,
             servers: Mutex::new(HashMap::new()),
+            backing_up: Mutex::new(HashSet::new()),
             panel: panel.to_string(),
             token: token.to_string(),
         }))
@@ -341,6 +347,7 @@ impl Runtime {
             stopping: AtomicBool::new(false),
             sleeping: AtomicBool::new(asleep),
             wake: Notify::new(),
+            output: broadcast::channel(256).0,
             stop_timeout_secs,
         });
         self.servers
@@ -527,6 +534,7 @@ impl Runtime {
                     tail.drain(..=pos);
                 }
             }
+            let _ = running.output.send(data.clone());
             self.emit(AgentMessage::ConsoleOutput(ConsoleOutput {
                 server_id: server_id.to_string(),
                 data,
@@ -846,6 +854,215 @@ impl Runtime {
         };
         if let Err(e) = result {
             warn!("Upload failed: {e:#}");
+        }
+    }
+
+    /// Answers `createBackup` with `backupResult` when done (ADR 0016).
+    pub async fn create_backup(self: Arc<Self>, request: CreateBackup) {
+        let id = request.server_id;
+        let result = self
+            .clone()
+            .backup(
+                &id,
+                Some(request.keep),
+                request.quiesce,
+                request.exclude,
+                false,
+            )
+            .await;
+        self.backup_result(id, BackupAction::Create, result);
+    }
+
+    /// Answers `restoreBackup` with `backupResult`. Backs up the current state first.
+    pub async fn restore_backup(self: Arc<Self>, request: RestoreBackup) {
+        let id = request.server_id;
+        let name = request.name;
+        let exclude = request.exclude;
+        let result = async {
+            if self.servers.lock().unwrap().contains_key(&id) {
+                return Err("Stop the server before restoring a backup".to_string());
+            }
+            self.clone()
+                .backup(&id, None, None, exclude.clone(), true)
+                .await?;
+            let (dir, backups) = (self.server_dir(&id)?, backup::dir(&self.data_dir, &id));
+            let restored = name.clone();
+            tokio::task::spawn_blocking(move || {
+                backup::restore(&dir, &backups, &restored, &exclude)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            info!("Restored {id} from {name}");
+            Ok((name, 0))
+        }
+        .await;
+        self.backup_result(id, BackupAction::Restore, result);
+    }
+
+    fn backup_result(
+        &self,
+        server_id: String,
+        action: BackupAction,
+        result: Result<(String, u64), String>,
+    ) {
+        if let Err(e) = &result {
+            warn!("Backup of {server_id} failed: {e}");
+        }
+        let (name, size, error) = match result {
+            Ok((name, size)) => (Some(name), (size > 0).then_some(size), None),
+            Err(e) => (None, None, Some(e)),
+        };
+        self.emit(AgentMessage::BackupResult(BackupResult {
+            server_id,
+            action,
+            name,
+            size,
+            error,
+        }));
+    }
+
+    /// Archives the server; a running one is quiesced with the template's commands first.
+    /// `keep` prunes the schedule's backups; `before_restore` names it so it is kept apart.
+    async fn backup(
+        self: Arc<Self>,
+        server_id: &str,
+        keep: Option<u32>,
+        quiesce: Option<Quiesce>,
+        exclude: Vec<String>,
+        before_restore: bool,
+    ) -> Result<(String, u64), String> {
+        let dir = self.server_dir(server_id)?;
+        if !self
+            .backing_up
+            .lock()
+            .unwrap()
+            .insert(server_id.to_string())
+        {
+            return Err("A backup of this server is already in progress".into());
+        }
+        let running = self
+            .servers
+            .lock()
+            .unwrap()
+            .get(server_id)
+            .cloned()
+            .filter(|r| !r.sleeping.load(Ordering::SeqCst));
+        let quiesce = running.as_ref().and(quiesce);
+        let saved = match (&running, &quiesce) {
+            (Some(running), Some(quiesce)) => {
+                self.clone().quiesce(server_id, running, quiesce).await
+            }
+            _ => Ok(()),
+        };
+        let result = match saved {
+            Ok(()) => {
+                let backups = backup::dir(&self.data_dir, server_id);
+                let name = backup::new_name(before_restore);
+                let archived = name.clone();
+                tokio::task::spawn_blocking(move || {
+                    let size = backup::create(&dir, &backups, &archived, &exclude)?;
+                    backup::prune(&backups, keep.unwrap_or(u32::MAX))?;
+                    Ok::<_, String>(size)
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+                .map(|size| (name, size))
+            }
+            Err(e) => Err(e),
+        };
+        // Saving goes back on even if the copy failed.
+        if let Some(quiesce) = quiesce {
+            for command in quiesce.after {
+                self.clone()
+                    .send_command(server_id.to_string(), command)
+                    .await;
+            }
+        }
+        self.backing_up.lock().unwrap().remove(server_id);
+        result
+    }
+
+    /// Sends the `before` commands and waits up to a minute for the `ready` line.
+    async fn quiesce(
+        self: Arc<Self>,
+        server_id: &str,
+        running: &Running,
+        quiesce: &Quiesce,
+    ) -> Result<(), String> {
+        let ready = quiesce
+            .ready
+            .as_deref()
+            .map(Regex::new)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut output = running.output.subscribe();
+        for command in &quiesce.before {
+            self.clone()
+                .send_command(server_id.to_string(), command.clone())
+                .await;
+        }
+        let Some(ready) = ready else { return Ok(()) };
+        let mut tail = String::new();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Ok(chunk) = output.recv().await {
+                tail.push_str(&chunk);
+                if ready.is_match(&tail) {
+                    return true;
+                }
+                if let Some(pos) = tail.rfind('\n') {
+                    tail.drain(..=pos);
+                }
+            }
+            false
+        })
+        .await
+        .ok()
+        .filter(|saved| *saved)
+        .map(|_| ())
+        .ok_or_else(|| "The game did not confirm saving within a minute".to_string())
+    }
+
+    /// Answers `listBackups` (ADR 0016).
+    pub async fn list_backups(self: Arc<Self>, request: ServerRequest) {
+        let result = match self.server_dir(&request.server_id) {
+            Ok(_) => {
+                let backups = backup::dir(&self.data_dir, &request.server_id);
+                tokio::task::spawn_blocking(move || backup::list(&backups))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            }
+            Err(e) => Err(e),
+        };
+        self.answer(
+            request.request_id,
+            result.map(|entries| (None, Some(entries))),
+        );
+    }
+
+    /// Answers `deleteBackup` (ADR 0016).
+    pub async fn delete_backup(self: Arc<Self>, request: BackupRef) {
+        let result = self.server_dir(&request.server_id).and_then(|_| {
+            backup::remove(
+                &backup::dir(&self.data_dir, &request.server_id),
+                &request.name,
+            )
+        });
+        self.reply(request.request_id, result.map(|()| None));
+    }
+
+    /// Streams a backup to the panel over a transfer channel (ADR 0015, 0016).
+    pub async fn send_backup(self: Arc<Self>, request: Transfer) {
+        let url = transfer::url(&self.panel, &request.transfer_id);
+        let result = match self.server_dir(&request.server_id) {
+            Ok(_) => {
+                let backups = backup::dir(&self.data_dir, &request.server_id);
+                transfer::download(&url, &self.token, backups, request.path).await
+            }
+            Err(e) => Err(anyhow::anyhow!(e)),
+        };
+        if let Err(e) = result {
+            warn!("Backup download failed: {e:#}");
         }
     }
 
