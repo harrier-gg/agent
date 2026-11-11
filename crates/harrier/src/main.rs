@@ -2,6 +2,7 @@
 //! `harrier agent run` connects to the panel and authenticates with the node's agent token.
 
 mod agent;
+mod query;
 mod runtime;
 
 use clap::{Parser, Subcommand};
