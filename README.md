@@ -11,11 +11,18 @@ Agent and CLI in one Rust binary (`harrier`). The agent runs on every machine th
 
 Requirements: Rust (version from `rust-toolchain.toml`, installed automatically by rustup), [just](https://just.systems).
 
+The agent authenticates with its node's token ([ADR 0004](https://github.com/harrier-gg/.github/blob/main/adr/0004-agent-authentication.md)). Register the node in `../backend` with `just node-create <name>`, then:
+
 ```bash
+export HARRIER_AGENT_TOKEN=hrr_…   # from the environment only, never as an argument
 just dev        # agent against the local panel (ws://localhost:8080/agent/ws)
 just protocol   # regenerate the TypeScript types, then run `just protocol` in ../backend
 just check      # everything CI checks
 ```
+
+The token never travels unencrypted over a network: the panel URL must use `wss://`, except for the own machine (`ws://localhost`). For a panel in a trusted home network without HTTPS, pass `--insecure` (or set `HARRIER_AGENT_INSECURE=true`); the agent warns on every start.
+
+Exit code 2 means the panel rejected the agent for good (invalid token, unsupported protocol, or another agent took over the same token); restarting will not help.
 
 Protocol versioning: see [ADR 0002](https://github.com/harrier-gg/.github/blob/main/adr/0002-agent-protocol-versioning.md). Log messages and CLI output are English only ([ADR 0003](https://github.com/harrier-gg/.github/blob/main/adr/0003-internationalization.md)).
 

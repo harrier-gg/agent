@@ -1,7 +1,7 @@
 default:
     @just --list
 
-# Run the agent against the local panel
+# Run the agent against the local panel (needs HARRIER_AGENT_TOKEN, see `just node-create` in ../backend)
 dev:
     cargo run -p harrier -- agent run --panel ws://localhost:8080/agent/ws
 
