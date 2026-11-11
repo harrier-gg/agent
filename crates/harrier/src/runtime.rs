@@ -87,6 +87,37 @@ pub struct Runtime {
     token: String,
 }
 
+/// Finds a pattern in console output, one complete line at a time. Console output is untrusted:
+/// players can write anything into chat, so a pattern only counts if it matches a whole line
+/// (templates anchor theirs to the game's own log lines), never text spread over several lines.
+#[derive(Default)]
+struct Lines {
+    /// The last, incomplete line.
+    tail: String,
+}
+
+impl Lines {
+    /// A line longer than this is dropped instead of growing without end.
+    const MAX: usize = 64 * 1024;
+
+    /// Adds output; returns whether a complete line matched.
+    fn feed(&mut self, chunk: &str, pattern: &Regex) -> bool {
+        static ANSI: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new("\x1b\\[[0-9;?]*[A-Za-z]").unwrap());
+        self.tail.push_str(chunk);
+        let mut found = false;
+        while let Some(end) = self.tail.find('\n') {
+            let line: String = self.tail.drain(..=end).collect();
+            let line = ANSI.replace_all(line.trim_end_matches(['\n', '\r']), "");
+            found |= pattern.is_match(&line);
+        }
+        if self.tail.len() > Self::MAX {
+            self.tail.clear();
+        }
+        found
+    }
+}
+
 fn container_name(server_id: &str) -> String {
     format!("harrier-{server_id}")
 }
@@ -520,19 +551,15 @@ impl Runtime {
         });
 
         let mut output = attach.output;
-        let mut tail = String::new(); // last partial line, so the ready pattern also matches across chunks
+        let mut lines = Lines::default();
         while let Some(chunk) = output.next().await {
             let Ok(chunk) = chunk else { break };
             let data = String::from_utf8_lossy(&chunk.into_bytes()).into_owned();
-            if let Some(pattern) = &ready {
-                tail.push_str(&data);
-                if pattern.is_match(&tail) {
-                    self.state(server_id, ServerStatus::Running, None);
-                    ready = None;
-                }
-                if let Some(pos) = tail.rfind('\n') {
-                    tail.drain(..=pos);
-                }
+            if let Some(pattern) = &ready
+                && lines.feed(&data, pattern)
+            {
+                self.state(server_id, ServerStatus::Running, None);
+                ready = None;
             }
             let _ = running.output.send(data.clone());
             self.emit(AgentMessage::ConsoleOutput(ConsoleOutput {
@@ -1003,15 +1030,11 @@ impl Runtime {
                 .await;
         }
         let Some(ready) = ready else { return Ok(()) };
-        let mut tail = String::new();
+        let mut lines = Lines::default();
         tokio::time::timeout(Duration::from_secs(60), async {
             while let Ok(chunk) = output.recv().await {
-                tail.push_str(&chunk);
-                if ready.is_match(&tail) {
+                if lines.feed(&chunk, &ready) {
                     return true;
-                }
-                if let Some(pos) = tail.rfind('\n') {
-                    tail.drain(..=pos);
                 }
             }
             false
@@ -1086,6 +1109,38 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_patterns_match_whole_lines_only() {
+        // The Minecraft template's pattern: the game's own line, not a player's chat.
+        let saved = Regex::new(
+            r"^\[[0-9:]{8}(\] \[Server thread/INFO\]| INFO\]): (System chat: )?Saved the game$",
+        )
+        .unwrap();
+        let mut lines = Lines::default();
+        assert!(!lines.feed(
+            "[12:00:00] [Server thread/INFO]: <Griefer> Saved the game\n",
+            &saved
+        ));
+        assert!(!lines.feed(
+            "[12:00:01] [Server thread/INFO]: <Griefer> x\n]: Saved the game",
+            &saved
+        ));
+        assert!(
+            !lines.feed("\n", &saved),
+            "chat text on its own line has no INFO prefix"
+        );
+        // Split over chunks, with a colour code and \r\n from the terminal.
+        assert!(!lines.feed(
+            "\x1b[0m[12:00:02] [Server thread/INFO]: System chat: Saved",
+            &saved
+        ));
+        assert!(lines.feed(" the game\x1b[0m\r\n", &saved));
+
+        // A line that never ends is dropped instead of growing without end.
+        lines.feed(&"x".repeat(Lines::MAX + 1), &saved);
+        assert!(lines.tail.is_empty());
+    }
 
     #[test]
     fn restarts_ready_servers_three_times_with_growing_delays() {
