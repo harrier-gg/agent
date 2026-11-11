@@ -5,6 +5,7 @@ mod agent;
 mod files;
 mod query;
 mod runtime;
+mod transfer;
 mod wake;
 
 use clap::{Parser, Subcommand};

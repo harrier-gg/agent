@@ -1,7 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
-use crate::{files, query, wake};
+use crate::{files, query, transfer, wake};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -11,9 +11,9 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, ConsoleOutput, FileResult, PortProtocol, QueryProtocol, QuerySpec, ReadFile,
-    Restart, RuntimeSpec, ServerPlayers, ServerState, ServerStats, ServerStatus, SleepSpec,
-    WakeProtocol, WriteFile,
+    AgentMessage, ConsoleOutput, FileEntry, FileResult, MovePath, PathRequest, PortProtocol,
+    QueryProtocol, QuerySpec, ReadFile, Restart, RuntimeSpec, ServerPlayers, ServerState,
+    ServerStats, ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -77,6 +77,9 @@ pub struct Runtime {
     data_dir: PathBuf,
     events: mpsc::Sender<AgentMessage>,
     servers: Mutex<HashMap<String, Arc<Running>>>,
+    /// Panel URL and agent token, for transfer channels (ADR 0015).
+    panel: String,
+    token: String,
 }
 
 fn container_name(server_id: &str) -> String {
@@ -84,13 +87,20 @@ fn container_name(server_id: &str) -> String {
 }
 
 impl Runtime {
-    pub fn new(data_dir: PathBuf, events: mpsc::Sender<AgentMessage>) -> anyhow::Result<Arc<Self>> {
+    pub fn new(
+        data_dir: PathBuf,
+        events: mpsc::Sender<AgentMessage>,
+        panel: &str,
+        token: &str,
+    ) -> anyhow::Result<Arc<Self>> {
         let docker = Docker::connect_with_defaults().context("Connecting to Docker")?;
         Ok(Arc::new(Self {
             docker,
             data_dir,
             events,
             servers: Mutex::new(HashMap::new()),
+            panel: panel.to_string(),
+            token: token.to_string(),
         }))
     }
 
@@ -739,18 +749,104 @@ impl Runtime {
     }
 
     fn reply(&self, request_id: String, result: Result<Option<String>, String>) {
+        self.answer(request_id, result.map(|content| (content, None)));
+    }
+
+    fn answer(
+        &self,
+        request_id: String,
+        result: Result<(Option<String>, Option<Vec<FileEntry>>), String>,
+    ) {
         if let Err(e) = &result {
             warn!("File request failed: {e}");
         }
-        let (content, error) = match result {
-            Ok(content) => (content, None),
-            Err(e) => (None, Some(e)),
+        let ((content, entries), error) = match result {
+            Ok(answer) => (answer, None),
+            Err(e) => ((None, None), Some(e)),
         };
         self.emit(AgentMessage::FileResult(FileResult {
             request_id,
             content,
             error,
+            entries,
         }));
+    }
+
+    /// Runs a file operation on a blocking thread, inside the server's data directory.
+    async fn in_server_dir<T: Send + 'static>(
+        &self,
+        server_id: &str,
+        operation: impl FnOnce(&std::path::Path) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let dir = self.server_dir(server_id)?;
+        tokio::task::spawn_blocking(move || operation(&dir))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()))
+    }
+
+    /// Answers `listDir` (ADR 0015).
+    pub async fn list_dir(self: Arc<Self>, request: PathRequest) {
+        let path = request.path;
+        let result = self
+            .in_server_dir(&request.server_id, move |dir| files::list(dir, &path))
+            .await;
+        self.answer(
+            request.request_id,
+            result.map(|entries| (None, Some(entries))),
+        );
+    }
+
+    /// Answers `deletePath` (ADR 0015).
+    pub async fn delete_path(self: Arc<Self>, request: PathRequest) {
+        let path = request.path;
+        let result = self
+            .in_server_dir(&request.server_id, move |dir| files::remove(dir, &path))
+            .await;
+        self.reply(request.request_id, result.map(|()| None));
+    }
+
+    /// Answers `makeDir` (ADR 0015).
+    pub async fn make_dir(self: Arc<Self>, request: PathRequest) {
+        let path = request.path;
+        let result = self
+            .in_server_dir(&request.server_id, move |dir| files::make_dir(dir, &path))
+            .await;
+        self.reply(request.request_id, result.map(|()| None));
+    }
+
+    /// Answers `movePath` (ADR 0015).
+    pub async fn move_path(self: Arc<Self>, request: MovePath) {
+        let (from, to) = (request.from, request.to);
+        let result = self
+            .in_server_dir(&request.server_id, move |dir| {
+                files::rename(dir, &from, &to)
+            })
+            .await;
+        self.reply(request.request_id, result.map(|()| None));
+    }
+
+    /// Streams a file to the panel over a transfer channel (ADR 0015).
+    pub async fn send_file(self: Arc<Self>, request: Transfer) {
+        let url = transfer::url(&self.panel, &request.transfer_id);
+        let result = match self.server_dir(&request.server_id) {
+            Ok(dir) => transfer::download(&url, &self.token, dir, request.path).await,
+            Err(e) => Err(anyhow::anyhow!(e)),
+        };
+        if let Err(e) = result {
+            warn!("Download failed: {e:#}");
+        }
+    }
+
+    /// Receives a file from the panel over a transfer channel (ADR 0015).
+    pub async fn receive_file(self: Arc<Self>, request: Transfer) {
+        let url = transfer::url(&self.panel, &request.transfer_id);
+        let result = match self.server_dir(&request.server_id) {
+            Ok(dir) => transfer::upload(&url, &self.token, dir, request.path).await,
+            Err(e) => Err(anyhow::anyhow!(e)),
+        };
+        if let Err(e) = result {
+            warn!("Upload failed: {e:#}");
+        }
     }
 
     /// Writes one line to the server's console. Line breaks inside the command are removed,

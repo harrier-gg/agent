@@ -26,7 +26,7 @@ pub async fn run(panel: &str, token: &str, data_dir: PathBuf) -> anyhow::Result<
     // The runtime and its event channel outlive single connections: servers keep running
     // while the agent reconnects.
     let (events_tx, mut events) = mpsc::channel(1024);
-    let runtime = Runtime::new(data_dir, events_tx)?;
+    let runtime = Runtime::new(data_dir, events_tx, panel, token)?;
     let mut backoff = Duration::from_secs(1);
     loop {
         tokio::select! {
@@ -149,6 +149,24 @@ async fn session(
             }
             PanelMessage::WriteFile(request) => {
                 tokio::spawn(runtime.clone().write_file(request));
+            }
+            PanelMessage::ListDir(request) => {
+                tokio::spawn(runtime.clone().list_dir(request));
+            }
+            PanelMessage::DeletePath(request) => {
+                tokio::spawn(runtime.clone().delete_path(request));
+            }
+            PanelMessage::MakeDir(request) => {
+                tokio::spawn(runtime.clone().make_dir(request));
+            }
+            PanelMessage::MovePath(request) => {
+                tokio::spawn(runtime.clone().move_path(request));
+            }
+            PanelMessage::SendFile(request) => {
+                tokio::spawn(runtime.clone().send_file(request));
+            }
+            PanelMessage::ReceiveFile(request) => {
+                tokio::spawn(runtime.clone().receive_file(request));
             }
             PanelMessage::SendCommand(cmd) => {
                 tokio::spawn(runtime.clone().send_command(cmd.server_id, cmd.command));
