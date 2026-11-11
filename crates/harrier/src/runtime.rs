@@ -1,7 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
-use crate::{backup, files, query, transfer, wake};
+use crate::{backup, download, files, query, transfer, wake};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -11,10 +11,10 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, BackupAction, BackupRef, BackupResult, ConsoleOutput, CreateBackup, FileEntry,
-    FileResult, MovePath, PathRequest, PortProtocol, QueryProtocol, QuerySpec, Quiesce, ReadFile,
-    Restart, RestoreBackup, RuntimeSpec, ServerPlayers, ServerRequest, ServerState, ServerStats,
-    ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
+    AgentMessage, BackupAction, BackupRef, BackupResult, ConsoleOutput, CreateBackup, DownloadFile,
+    FileEntry, FileResult, MovePath, PathRequest, PortProtocol, QueryProtocol, QuerySpec, Quiesce,
+    ReadFile, Restart, RestoreBackup, RuntimeSpec, ServerPlayers, ServerRequest, ServerState,
+    ServerStats, ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
 };
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -851,6 +851,33 @@ impl Runtime {
             request.request_id,
             result.map(|entries| (None, Some(entries))),
         );
+    }
+
+    /// Answers `downloadFile` once the file is in place (ADR 0017).
+    pub async fn download_file(self: Arc<Self>, request: DownloadFile) {
+        let DownloadFile {
+            request_id,
+            server_id,
+            url,
+            path,
+            size,
+            sha512,
+            sha1,
+        } = request;
+        let result = self
+            .in_server_dir(&server_id, move |dir| {
+                let expected = download::Expected {
+                    size,
+                    sha512: sha512.as_deref(),
+                    sha1: sha1.as_deref(),
+                };
+                download::download(dir, &path, &url, &expected)
+            })
+            .await;
+        if let Ok(size) = &result {
+            info!("Downloaded {size} bytes for {server_id}");
+        }
+        self.reply(request_id, result.map(|_| None));
     }
 
     /// Answers `deletePath` (ADR 0015).

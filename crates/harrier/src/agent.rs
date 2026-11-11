@@ -162,6 +162,9 @@ async fn session(
             PanelMessage::MovePath(request) => {
                 tokio::spawn(runtime.clone().move_path(request));
             }
+            PanelMessage::DownloadFile(request) => {
+                tokio::spawn(runtime.clone().download_file(request));
+            }
             PanelMessage::CreateBackup(request) => {
                 tokio::spawn(runtime.clone().create_backup(request));
             }

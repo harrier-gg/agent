@@ -3,6 +3,7 @@
 
 mod agent;
 mod backup;
+mod download;
 mod files;
 mod query;
 mod runtime;
