@@ -20,6 +20,8 @@ just protocol   # regenerate the TypeScript types, then run `just protocol` in .
 just check      # everything CI checks
 ```
 
+The token never travels unencrypted over a network: the panel URL must use `wss://`, except for the own machine (`ws://localhost`). For a panel in a trusted home network without HTTPS, pass `--insecure` (or set `HARRIER_AGENT_INSECURE=true`); the agent warns on every start.
+
 Exit code 2 means the panel rejected the agent for good (invalid token, unsupported protocol, or another agent took over the same token); restarting will not help.
 
 Protocol versioning: see [ADR 0002](https://github.com/harrier-gg/.github/blob/main/adr/0002-agent-protocol-versioning.md). Log messages and CLI output are English only ([ADR 0003](https://github.com/harrier-gg/.github/blob/main/adr/0003-internationalization.md)).
