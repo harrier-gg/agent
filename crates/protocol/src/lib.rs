@@ -28,6 +28,8 @@ pub enum AgentMessage {
     ServerStats(ServerStats),
     /// Who is online, for servers whose spec has a `query` (ADR 0009). Sent every few seconds.
     ServerPlayers(ServerPlayers),
+    /// Reply to `readFile` or `writeFile` (ADR 0011).
+    FileResult(FileResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -56,6 +58,43 @@ pub enum PanelMessage {
     StopServer(ServerRef),
     /// Write one line to a server's console.
     SendCommand(SendCommand),
+    /// Read a text file in a server's data directory (ADR 0011). Answered with `fileResult`.
+    ReadFile(ReadFile),
+    /// Replace a text file in a server's data directory (ADR 0011). Answered with `fileResult`.
+    WriteFile(WriteFile),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReadFile {
+    pub request_id: String,
+    pub server_id: String,
+    /// Relative to the server's data directory, e.g. `server.properties`.
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct WriteFile {
+    pub request_id: String,
+    pub server_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct FileResult {
+    pub request_id: String,
+    /// The file's text for `readFile`; `null` if it does not exist (yet) or after `writeFile`.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Why the request failed (English); `null` on success.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

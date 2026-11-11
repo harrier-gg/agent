@@ -371,6 +371,7 @@ dependencies = [
  "clap",
  "futures-util",
  "harrier-protocol",
+ "libc",
  "regex",
  "serde_json",
  "tokio",

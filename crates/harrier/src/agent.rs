@@ -144,6 +144,12 @@ async fn session(
             PanelMessage::StopServer(stop) => {
                 tokio::spawn(runtime.clone().stop(stop.server_id));
             }
+            PanelMessage::ReadFile(request) => {
+                tokio::spawn(runtime.clone().read_file(request));
+            }
+            PanelMessage::WriteFile(request) => {
+                tokio::spawn(runtime.clone().write_file(request));
+            }
             PanelMessage::SendCommand(cmd) => {
                 tokio::spawn(runtime.clone().send_command(cmd.server_id, cmd.command));
             }

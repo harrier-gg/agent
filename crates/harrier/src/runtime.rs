@@ -1,7 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
-use crate::query;
+use crate::{files, query};
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -11,8 +11,8 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, ConsoleOutput, PortProtocol, QueryProtocol, QuerySpec, Restart, RuntimeSpec,
-    ServerPlayers, ServerState, ServerStats, ServerStatus,
+    AgentMessage, ConsoleOutput, FileResult, PortProtocol, QueryProtocol, QuerySpec, ReadFile,
+    Restart, RuntimeSpec, ServerPlayers, ServerState, ServerStats, ServerStatus, WriteFile,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -535,6 +535,54 @@ impl Runtime {
         {
             warn!("Stopping {server_id} failed: {e:#}");
         }
+    }
+
+    /// The server's data directory. Server IDs come from the panel; anything but a plain name is
+    /// refused, so an ID can never point outside the data directory.
+    fn server_dir(&self, server_id: &str) -> Result<PathBuf, String> {
+        if server_id.is_empty()
+            || !server_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err("Invalid server ID".into());
+        }
+        Ok(self.data_dir.join(server_id))
+    }
+
+    /// Answers `readFile` (ADR 0011).
+    pub async fn read_file(self: Arc<Self>, request: ReadFile) {
+        let dir = self.server_dir(&request.server_id);
+        let result = tokio::task::spawn_blocking(move || files::read(&dir?, &request.path))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        self.reply(request.request_id, result);
+    }
+
+    /// Answers `writeFile` (ADR 0011).
+    pub async fn write_file(self: Arc<Self>, request: WriteFile) {
+        let dir = self.server_dir(&request.server_id);
+        let result = tokio::task::spawn_blocking(move || {
+            files::write(&dir?, &request.path, &request.content).map(|()| None)
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        self.reply(request.request_id, result);
+    }
+
+    fn reply(&self, request_id: String, result: Result<Option<String>, String>) {
+        if let Err(e) = &result {
+            warn!("File request failed: {e}");
+        }
+        let (content, error) = match result {
+            Ok(content) => (content, None),
+            Err(e) => (None, Some(e)),
+        };
+        self.emit(AgentMessage::FileResult(FileResult {
+            request_id,
+            content,
+            error,
+        }));
     }
 
     /// Writes one line to the server's console. Line breaks inside the command are removed,
