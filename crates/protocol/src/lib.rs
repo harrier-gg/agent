@@ -181,6 +181,18 @@ pub struct ServerState {
     /// Human-readable detail, e.g. an error or download progress (English).
     #[serde(default)]
     pub message: Option<String>,
+    /// Set while the agent waits to restart a crashed server (ADR 0010).
+    #[serde(default)]
+    pub restart: Option<Restart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Restart {
+    /// 1 for the first restart after a crash.
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -292,7 +304,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             serde_json::to_value(&state).unwrap(),
-            json!({"type": "serverState", "serverId": "s1", "status": "running", "message": null})
+            json!({"type": "serverState", "serverId": "s1", "status": "running", "message": null, "restart": null})
         );
     }
 }
