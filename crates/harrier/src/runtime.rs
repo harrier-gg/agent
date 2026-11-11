@@ -1,6 +1,7 @@
 //! Runs game servers as Docker containers from game-neutral runtime specs (ADR 0005).
 //! The agent knows no games: image, env, ports and limits all come from the panel.
 
+use crate::query;
 use anyhow::Context;
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
@@ -10,7 +11,8 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use harrier_protocol::{
-    AgentMessage, ConsoleOutput, PortProtocol, RuntimeSpec, ServerState, ServerStats, ServerStatus,
+    AgentMessage, ConsoleOutput, PortProtocol, QueryProtocol, QuerySpec, RuntimeSpec,
+    ServerPlayers, ServerState, ServerStats, ServerStatus,
 };
 use regex::Regex;
 use std::collections::HashMap;
@@ -26,6 +28,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const LABEL: &str = "gg.harrier.server";
+/// The spec's `query`, kept on the container so a restarted agent keeps asking (ADR 0009).
+const QUERY_LABEL: &str = "gg.harrier.query";
+const PLAYERS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const DEFAULT_STOP_TIMEOUT_SECS: i32 = 30;
 
 type Stdin = Pin<Box<dyn AsyncWrite + Send>>;
@@ -104,6 +109,11 @@ impl Runtime {
                 self.state(&server_id, ServerStatus::Stopped, None);
                 continue;
             }
+            let query = container
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(QUERY_LABEL))
+                .and_then(|q| serde_json::from_str::<QuerySpec>(q).ok());
             let known = self.servers.lock().unwrap().contains_key(&server_id);
             if known {
                 self.state(&server_id, ServerStatus::Running, None);
@@ -111,7 +121,7 @@ impl Runtime {
                 let this = self.clone();
                 tokio::spawn(async move {
                     if let Err(e) = this
-                        .supervise(&server_id, None, DEFAULT_STOP_TIMEOUT_SECS)
+                        .supervise(&server_id, None, DEFAULT_STOP_TIMEOUT_SECS, query)
                         .await
                     {
                         warn!("Re-attaching to {server_id} failed: {e:#}");
@@ -188,11 +198,15 @@ impl Runtime {
             );
         }
 
+        let mut labels = HashMap::from([(LABEL.to_string(), server_id.to_string())]);
+        if let Some(query) = &spec.query {
+            labels.insert(QUERY_LABEL.to_string(), serde_json::to_string(query)?);
+        }
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             exposed_ports: Some(exposed),
-            labels: Some(HashMap::from([(LABEL.to_string(), server_id.to_string())])),
+            labels: Some(labels),
             // The server runs as the owner of its data directory, never as root.
             user: Some(format!("{}:{}", owner.uid(), owner.gid())),
             tty: Some(true),
@@ -232,7 +246,7 @@ impl Runtime {
         let this = self.clone();
         let id = server_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = this.supervise(&id, ready, timeout).await {
+            if let Err(e) = this.supervise(&id, ready, timeout, spec.query).await {
                 warn!("Supervising {id} failed: {e:#}");
             }
         });
@@ -245,6 +259,7 @@ impl Runtime {
         server_id: &str,
         ready: Option<Regex>,
         stop_timeout_secs: i32,
+        query: Option<QuerySpec>,
     ) -> anyhow::Result<()> {
         let name = container_name(server_id);
         let attach = self
@@ -275,6 +290,8 @@ impl Runtime {
         }
 
         let stats = tokio::spawn(self.clone().stream_stats(server_id.to_string()));
+        let players =
+            query.map(|q| tokio::spawn(self.clone().poll_players(server_id.to_string(), q)));
 
         let mut output = attach.output;
         let mut ready = ready;
@@ -304,6 +321,9 @@ impl Runtime {
             .next()
             .await;
         stats.abort();
+        if let Some(players) = players {
+            players.abort();
+        }
         self.servers.lock().unwrap().remove(server_id);
 
         let code = match exit {
@@ -370,6 +390,26 @@ impl Runtime {
                 memory_bytes: memory.usage.unwrap_or(0).saturating_sub(cache),
                 memory_limit_bytes: memory.limit.unwrap_or(0),
             }));
+        }
+    }
+
+    /// Asks the server who is online. Failures are expected while it starts and are not reported.
+    async fn poll_players(self: Arc<Self>, server_id: String, query: QuerySpec) {
+        let mut tick = tokio::time::interval(PLAYERS_INTERVAL);
+        loop {
+            tick.tick().await;
+            let result = match query.protocol {
+                QueryProtocol::Minecraft => query::minecraft(query.port).await,
+                QueryProtocol::Unsupported => return,
+            };
+            if let Ok(players) = result {
+                self.emit(AgentMessage::ServerPlayers(ServerPlayers {
+                    server_id: server_id.clone(),
+                    online: players.online,
+                    max: players.max,
+                    names: players.names,
+                }));
+            }
         }
     }
 

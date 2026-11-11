@@ -26,6 +26,8 @@ pub enum AgentMessage {
     ConsoleOutput(ConsoleOutput),
     /// Resource usage of a running server, sent every few seconds.
     ServerStats(ServerStats),
+    /// Who is online, for servers whose spec has a `query` (ADR 0009). Sent every few seconds.
+    ServerPlayers(ServerPlayers),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -89,6 +91,31 @@ pub struct RuntimeSpec {
     #[serde(default)]
     pub ready_pattern: Option<String>,
     pub stop_timeout_secs: u32,
+    /// How to ask the running server who is online. Without it, there is no player list.
+    #[serde(default)]
+    pub query: Option<QuerySpec>,
+}
+
+/// A query protocol and the host port it answers on (ADR 0009).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct QuerySpec {
+    pub protocol: QueryProtocol,
+    pub port: u16,
+}
+
+/// Network protocols for asking game servers, not games.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum QueryProtocol {
+    /// Minecraft: Java Edition Server List Ping.
+    Minecraft,
+    /// A protocol of a newer panel; this agent does not ask.
+    #[serde(other)]
+    #[ts(skip)]
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -176,6 +203,17 @@ pub struct ServerStats {
     pub memory_limit_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ServerPlayers {
+    pub server_id: String,
+    pub online: u32,
+    pub max: u32,
+    /// Names of online players; may be fewer than `online` (Minecraft sends at most 12).
+    pub names: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +274,14 @@ mod tests {
         };
         assert_eq!(start.spec.ports[0].protocol, PortProtocol::Tcp);
         assert_eq!(start.spec.env["TYPE"], "PAPER");
+        assert_eq!(start.spec.query, None);
+    }
+
+    #[test]
+    fn unknown_query_protocols_do_not_break_starting() {
+        let spec: QuerySpec =
+            serde_json::from_value(json!({"protocol": "a2s", "port": 27015})).unwrap();
+        assert_eq!(spec.protocol, QueryProtocol::Unsupported);
     }
 
     #[test]
