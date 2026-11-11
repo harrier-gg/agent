@@ -89,30 +89,46 @@ pub struct Runtime {
 
 /// Finds a pattern in console output, one complete line at a time. Console output is untrusted:
 /// players can write anything into chat, so a pattern only counts if it matches a whole line
-/// (templates anchor theirs to the game's own log lines), never text spread over several lines.
+/// (templates anchor theirs to the game's own log lines). Text is only treated as the start of a
+/// line after a line break this reader saw itself: never the rest of a line it joined in the
+/// middle of, or the rest of a line too long to keep.
 #[derive(Default)]
 struct Lines {
     /// The last, incomplete line.
     tail: String,
+    /// Skip everything up to the next line break: the reader is not at a line start.
+    resync: bool,
 }
 
 impl Lines {
     /// A line longer than this is dropped instead of growing without end.
     const MAX: usize = 64 * 1024;
 
+    /// For output that is already flowing, e.g. a backup that starts listening to a running server.
+    fn mid_stream() -> Self {
+        Self {
+            tail: String::new(),
+            resync: true,
+        }
+    }
+
     /// Adds output; returns whether a complete line matched.
     fn feed(&mut self, chunk: &str, pattern: &Regex) -> bool {
         static ANSI: std::sync::LazyLock<Regex> =
-            std::sync::LazyLock::new(|| Regex::new("\x1b\\[[0-9;?]*[A-Za-z]").unwrap());
+            std::sync::LazyLock::new(|| Regex::new("\\x1b\\[[0-9;?]*[A-Za-z]").unwrap());
         self.tail.push_str(chunk);
         let mut found = false;
         while let Some(end) = self.tail.find('\n') {
             let line: String = self.tail.drain(..=end).collect();
+            if std::mem::take(&mut self.resync) {
+                continue; // the end of a line whose start this reader did not see
+            }
             let line = ANSI.replace_all(line.trim_end_matches(['\n', '\r']), "");
             found |= pattern.is_match(&line);
         }
         if self.tail.len() > Self::MAX {
             self.tail.clear();
+            self.resync = true;
         }
         found
     }
@@ -1030,7 +1046,8 @@ impl Runtime {
                 .await;
         }
         let Some(ready) = ready else { return Ok(()) };
-        let mut lines = Lines::default();
+        // Subscribed while output flows: the first line may be the end of someone's chat line.
+        let mut lines = Lines::mid_stream();
         tokio::time::timeout(Duration::from_secs(60), async {
             while let Ok(chunk) = output.recv().await {
                 if lines.feed(&chunk, &ready) {
@@ -1137,9 +1154,28 @@ mod tests {
         ));
         assert!(lines.feed(" the game\x1b[0m\r\n", &saved));
 
-        // A line that never ends is dropped instead of growing without end.
+        // A line that never ends is dropped, and so is the rest of it once its end arrives.
         lines.feed(&"x".repeat(Lines::MAX + 1), &saved);
         assert!(lines.tail.is_empty());
+        assert!(!lines.feed(
+            "[12:00:03] [Server thread/INFO]: System chat: Saved the game\n",
+            &saved
+        ));
+        assert!(lines.feed(
+            "[12:00:04] [Server thread/INFO]: System chat: Saved the game\n",
+            &saved
+        ));
+
+        // Joining mid-line: the first piece is the end of a line whose start was not seen.
+        let mut joined = Lines::mid_stream();
+        assert!(!joined.feed(
+            "[12:00:05] [Server thread/INFO]: System chat: Saved the game\n",
+            &saved
+        ));
+        assert!(joined.feed(
+            "[12:00:06] [Server thread/INFO]: System chat: Saved the game\n",
+            &saved
+        ));
     }
 
     #[test]
