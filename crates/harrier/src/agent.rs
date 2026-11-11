@@ -2,19 +2,27 @@ use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
 use harrier_protocol::{AgentMessage, Hello, PROTOCOL_VERSION, PanelMessage};
 use std::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Close code the panel uses when another connection with the same token took over (ADR 0004).
+const CLOSE_REPLACED: u16 = 4002;
 
 /// Connects to the panel and keeps the connection. When it drops, the agent reconnects with a
-/// growing pause. A rejection (e.g. wrong protocol version) stops the agent, because retrying
-/// would not change anything.
-pub async fn run(panel: &str) -> anyhow::Result<()> {
+/// growing pause. A rejection (invalid token, wrong protocol version, replaced by another agent)
+/// stops the agent, because retrying would not change anything.
+///
+/// The token authenticates the node (ADR 0004). It is sent in the `Authorization` header of the
+/// WebSocket upgrade and never logged.
+pub async fn run(panel: &str, token: &str) -> anyhow::Result<()> {
     let mut backoff = Duration::from_secs(1);
     loop {
         tokio::select! {
-            result = session(panel) => match result {
+            result = session(panel, token) => match result {
                 Ok(Outcome::Rejected(reason)) => {
                     error!("The panel rejected this agent: {reason}");
                     std::process::exit(2);
@@ -41,10 +49,23 @@ enum Outcome {
     Rejected(String),
 }
 
-async fn session(panel: &str) -> anyhow::Result<Outcome> {
-    let (mut ws, _) = connect_async(panel)
-        .await
-        .with_context(|| format!("Connecting to {panel}"))?;
+async fn session(panel: &str, token: &str) -> anyhow::Result<Outcome> {
+    let mut request = panel
+        .into_client_request()
+        .with_context(|| format!("Invalid panel URL {panel}"))?;
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))?;
+    bearer.set_sensitive(true);
+    request.headers_mut().insert(AUTHORIZATION, bearer);
+
+    let mut ws = match connect_async(request).await {
+        Ok((ws, _)) => ws,
+        Err(WsError::Http(response)) if response.status() == StatusCode::UNAUTHORIZED => {
+            return Ok(Outcome::Rejected(
+                "the agent token is invalid or the node was removed. Register the node again and set HARRIER_AGENT_TOKEN".into(),
+            ));
+        }
+        Err(e) => return Err(e).with_context(|| format!("Connecting to {panel}")),
+    };
 
     let hello = AgentMessage::Hello(Hello {
         protocol: PROTOCOL_VERSION,
@@ -57,7 +78,16 @@ async fn session(panel: &str) -> anyhow::Result<Outcome> {
         .await?;
 
     while let Some(msg) = ws.next().await {
-        let Message::Text(text) = msg? else { continue };
+        let text = match msg? {
+            Message::Text(text) => text,
+            Message::Close(Some(frame)) if u16::from(frame.code) == CLOSE_REPLACED => {
+                return Ok(Outcome::Rejected(
+                    "another agent connected with the same token. Each node needs its own token"
+                        .into(),
+                ));
+            }
+            _ => continue,
+        };
         match serde_json::from_str::<PanelMessage>(&text)? {
             PanelMessage::Welcome(w) => {
                 info!(

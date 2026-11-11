@@ -1,5 +1,5 @@
 //! `harrier`: agent and CLI in one binary.
-//! M0: `harrier agent run` connects to the panel and performs the handshake.
+//! `harrier agent run` connects to the panel and authenticates with the node's agent token.
 
 mod agent;
 
@@ -24,7 +24,10 @@ enum Command {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Start the agent and connect it to the panel
+    /// Start the agent and connect it to the panel.
+    ///
+    /// The agent token is read from HARRIER_AGENT_TOKEN (not from an argument, because arguments
+    /// are visible to other users via `ps`).
     Run {
         /// WebSocket URL of the panel
         #[arg(
@@ -47,6 +50,21 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Agent {
             command: AgentCommand::Run { panel },
-        } => agent::run(&panel).await,
+        } => {
+            let token = agent_token()?;
+            agent::run(&panel, &token).await
+        }
     }
+}
+
+/// Reads the agent token from the environment (ADR 0004).
+fn agent_token() -> anyhow::Result<String> {
+    let token = std::env::var("HARRIER_AGENT_TOKEN").unwrap_or_default();
+    if !token.starts_with("hrr_") {
+        anyhow::bail!(
+            "HARRIER_AGENT_TOKEN is missing or not an agent token (it starts with \"hrr_\"). \
+             Register the node in the panel to get one."
+        );
+    }
+    Ok(token)
 }
