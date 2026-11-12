@@ -90,6 +90,9 @@ pub enum PanelMessage {
     /// Download a file from the internet into the server's data directory, e.g. a mod (ADR 0017).
     /// Answered with `fileResult` once it is in place.
     DownloadFile(DownloadFile),
+    /// Delete a stopped server: its container, data directory and backups. Answered with
+    /// `fileResult`; a running server is refused.
+    DeleteServer(ServerRequest),
 }
 
 /// HTTPS only; the file is moved into place only if size and hash match.

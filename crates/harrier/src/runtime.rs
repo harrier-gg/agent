@@ -1113,6 +1113,66 @@ impl Runtime {
         );
     }
 
+    /// Answers `deleteServer`: removes the container, the data directory and the backups. Refused
+    /// while the server runs or sleeps, or while a backup is being made.
+    pub async fn delete_server(self: Arc<Self>, request: ServerRequest) {
+        let id = request.server_id;
+        let result = async {
+            let dir = self.server_dir(&id)?;
+            if self.servers.lock().unwrap().contains_key(&id) {
+                return Err("Stop the server before deleting it".to_string());
+            }
+            // Holding the backup slot keeps a scheduled backup from starting meanwhile.
+            if !self.backing_up.lock().unwrap().insert(id.clone()) {
+                return Err(
+                    "A backup of this server is in progress; try again when it is done".into(),
+                );
+            }
+            let removed = async {
+                match self
+                    .docker
+                    .remove_container(
+                        &container_name(&id),
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(bollard::errors::Error::DockerResponseServerError {
+                        status_code: 404,
+                        ..
+                    }) => {}
+                    Err(e) => return Err(format!("Removing the container: {e}")),
+                }
+                let backups = backup::dir(&self.data_dir, &id);
+                tokio::task::spawn_blocking(move || {
+                    for dir in [dir, backups] {
+                        match std::fs::remove_dir_all(&dir) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(format!("Deleting {}: {e}", dir.display()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
+            .await;
+            self.backing_up.lock().unwrap().remove(&id);
+            removed
+        }
+        .await;
+        if result.is_ok() {
+            info!("Deleted server {id}");
+        }
+        self.reply(request.request_id, result.map(|()| None));
+    }
+
     /// Answers `deleteBackup` (ADR 0016).
     pub async fn delete_backup(self: Arc<Self>, request: BackupRef) {
         let result = self.server_dir(&request.server_id).and_then(|_| {
