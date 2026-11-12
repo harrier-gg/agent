@@ -174,6 +174,9 @@ async fn session(
             PanelMessage::DeleteBackup(request) => {
                 tokio::spawn(runtime.clone().delete_backup(request));
             }
+            PanelMessage::DeleteServer(request) => {
+                tokio::spawn(runtime.clone().delete_server(request));
+            }
             PanelMessage::RestoreBackup(request) => {
                 tokio::spawn(runtime.clone().restore_backup(request));
             }
