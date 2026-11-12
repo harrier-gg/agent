@@ -87,6 +87,29 @@ pub enum PanelMessage {
     RestoreBackup(RestoreBackup),
     /// Stream a backup to the panel over the transfer channel; `path` is the backup's name.
     SendBackup(Transfer),
+    /// Download a file from the internet into the server's data directory, e.g. a mod (ADR 0017).
+    /// Answered with `fileResult` once it is in place.
+    DownloadFile(DownloadFile),
+}
+
+/// HTTPS only; the file is moved into place only if size and hash match.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DownloadFile {
+    pub request_id: String,
+    pub server_id: String,
+    pub url: String,
+    /// Relative to the server's data directory, e.g. `mods/sodium.jar`.
+    pub path: String,
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub size: Option<u64>,
+    /// Hex. At least one of the two is required.
+    #[serde(default)]
+    pub sha512: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
