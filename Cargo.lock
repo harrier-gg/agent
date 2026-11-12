@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "harrier"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bollard",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "harrier-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",

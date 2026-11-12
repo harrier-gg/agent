@@ -9,6 +9,10 @@ export type DownloadFile = { requestId: string, serverId: string, url: string,
  */
 path: string, size: number | null, 
 /**
- * Hex. At least one of the two is required.
+ * Hex. At least one hash is required; every one given must match.
  */
-sha512: string | null, sha1: string | null, };
+sha512: string | null, sha1: string | null, 
+/**
+ * Hangar only publishes SHA-256.
+ */
+sha256: string | null, };

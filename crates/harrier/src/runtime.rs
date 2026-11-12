@@ -863,6 +863,7 @@ impl Runtime {
             size,
             sha512,
             sha1,
+            sha256,
         } = request;
         let result = self
             .in_server_dir(&server_id, move |dir| {
@@ -870,6 +871,7 @@ impl Runtime {
                     size,
                     sha512: sha512.as_deref(),
                     sha1: sha1.as_deref(),
+                    sha256: sha256.as_deref(),
                 };
                 download::download(dir, &path, &url, &expected)
             })
