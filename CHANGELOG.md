@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/harrier-gg/agent/compare/v0.5.0...v0.6.0) (2026-11-12)
+
+
+### Features
+
+* download files into a server with size and hash checks ([#19](https://github.com/harrier-gg/agent/issues/19)) ([203030a](https://github.com/harrier-gg/agent/commit/203030aa8180db6daa0f67f478e85ee8092c82a8))
+
 ## [0.5.0](https://github.com/harrier-gg/agent/compare/v0.4.0...v0.5.0) (2026-11-11)
 
 
