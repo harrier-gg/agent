@@ -13,6 +13,7 @@ pub struct Expected<'a> {
     pub size: Option<u64>,
     pub sha512: Option<&'a str>,
     pub sha1: Option<&'a str>,
+    pub sha256: Option<&'a str>,
 }
 
 /// Downloads `url` to `path` inside `root`; returns the size.
@@ -20,7 +21,7 @@ pub fn download(root: &Path, path: &str, url: &str, expected: &Expected) -> Resu
     if !url.starts_with("https://") {
         return Err("Only HTTPS downloads are allowed".into());
     }
-    if expected.sha512.is_none() && expected.sha1.is_none() {
+    if expected.sha512.is_none() && expected.sha1.is_none() && expected.sha256.is_none() {
         return Err("A download needs a hash".into());
     }
     let limit = expected.size.unwrap_or(MAX_BYTES).min(MAX_BYTES);
@@ -37,6 +38,7 @@ pub fn download(root: &Path, path: &str, url: &str, expected: &Expected) -> Resu
     // Two crates with different `Digest` trait versions: each through its own.
     let mut sha512 = <sha2::Sha512 as sha2::Digest>::new();
     let mut sha1 = <sha1::Sha1 as sha1::Digest>::new();
+    let mut sha256 = <sha2::Sha256 as sha2::Digest>::new();
     let mut size = 0u64;
     let mut buffer = vec![0; 64 * 1024];
     let copied = loop {
@@ -52,6 +54,7 @@ pub fn download(root: &Path, path: &str, url: &str, expected: &Expected) -> Resu
         let chunk = &buffer[..read];
         sha2::Digest::update(&mut sha512, chunk);
         sha1::Digest::update(&mut sha1, chunk);
+        sha2::Digest::update(&mut sha256, chunk);
         if let Err(e) = upload.file.write_all(chunk) {
             break Err(format!("Writing {path}: {e}"));
         }
@@ -68,6 +71,7 @@ pub fn download(root: &Path, path: &str, url: &str, expected: &Expected) -> Resu
         };
         if !matches(expected.sha512, hex::encode(sha2::Digest::finalize(sha512)))
             || !matches(expected.sha1, hex::encode(sha1::Digest::finalize(sha1)))
+            || !matches(expected.sha256, hex::encode(sha2::Digest::finalize(sha256)))
         {
             return Err(format!(
                 "{path} does not match its hash; it was not installed"
@@ -95,6 +99,7 @@ mod tests {
             size: None,
             sha512: Some("00"),
             sha1: None,
+            sha256: None,
         };
         assert!(
             download(&root, "mods/x.jar", "http://example.com/x.jar", &any)
@@ -105,6 +110,7 @@ mod tests {
             size: None,
             sha512: None,
             sha1: None,
+            sha256: None,
         };
         assert!(
             download(&root, "mods/x.jar", "https://example.com/x.jar", &none)

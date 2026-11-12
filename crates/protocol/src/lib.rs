@@ -105,11 +105,14 @@ pub struct DownloadFile {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub size: Option<u64>,
-    /// Hex. At least one of the two is required.
+    /// Hex. At least one hash is required; every one given must match.
     #[serde(default)]
     pub sha512: Option<String>,
     #[serde(default)]
     pub sha1: Option<String>,
+    /// Hangar only publishes SHA-256.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
