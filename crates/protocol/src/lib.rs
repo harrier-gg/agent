@@ -330,6 +330,29 @@ pub struct RuntimeSpec {
     /// Put the server to sleep when nobody is online (ADR 0013). Needs `query`.
     #[serde(default)]
     pub sleep: Option<SleepSpec>,
+    /// Where the data directory is mounted in the container, an absolute plain path like
+    /// `/home/container`. Without it, `/data`.
+    #[serde(default)]
+    pub mount_path: Option<String>,
+    /// A script that prepares the data directory before the server starts, like a
+    /// Pterodactyl egg's install script (ADR 0022).
+    #[serde(default)]
+    pub install: Option<InstallSpec>,
+    /// Signal that asks the server to stop: `SIGINT` or `SIGTERM`. Without it, `SIGTERM`.
+    #[serde(default)]
+    pub stop_signal: Option<String>,
+}
+
+/// Runs `<entrypoint> -c <script>` in `image` as root with the data directory at `/mnt/server`
+/// (ADR 0022). The data directory is handed back to its owner afterwards.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct InstallSpec {
+    pub image: String,
+    /// The shell, e.g. `bash`.
+    pub entrypoint: String,
+    pub script: String,
 }
 
 /// When to sleep and how to wake (ADR 0013).
@@ -387,6 +410,8 @@ pub struct QuerySpec {
 pub enum QueryProtocol {
     /// Minecraft: Java Edition Server List Ping.
     Minecraft,
+    /// Steam's A2S_INFO and A2S_PLAYER (Source engine query).
+    A2s,
     /// A protocol of a newer panel; this agent does not ask.
     #[serde(other)]
     #[ts(skip)]
@@ -569,7 +594,7 @@ mod tests {
     #[test]
     fn unknown_query_protocols_do_not_break_starting() {
         let spec: QuerySpec =
-            serde_json::from_value(json!({"protocol": "a2s", "port": 27015})).unwrap();
+            serde_json::from_value(json!({"protocol": "gamespy4", "port": 27015})).unwrap();
         assert_eq!(spec.protocol, QueryProtocol::Unsupported);
     }
 

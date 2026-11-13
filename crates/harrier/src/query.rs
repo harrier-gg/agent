@@ -4,7 +4,7 @@
 use anyhow::{Context, bail, ensure};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -79,6 +79,101 @@ fn parse_minecraft_status(json: &[u8]) -> anyhow::Result<Players> {
         max: count("max")?,
         names,
     })
+}
+
+/// Steam's A2S_INFO and A2S_PLAYER on `127.0.0.1:<port>`
+/// (<https://developer.valvesoftware.com/wiki/Server_queries>). The count comes from A2S_INFO;
+/// names are left out if A2S_PLAYER fails or sends empty ones (Valheim does).
+pub async fn a2s(port: u16) -> anyhow::Result<Players> {
+    tokio::time::timeout(TIMEOUT, async {
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(("127.0.0.1", port)).await?;
+        let info = a2s_exchange(&socket, 0x54, b"Source Engine Query\0", None, 0x49).await?;
+        let (online, max) = parse_a2s_info(&info)?;
+        let names = match a2s_exchange(&socket, 0x55, b"", Some([0xff; 4]), 0x44).await {
+            Ok(reply) => parse_a2s_players(&reply)?,
+            Err(_) => Vec::new(),
+        };
+        Ok(Players { online, max, names })
+    })
+    .await
+    .context("no answer")?
+}
+
+/// Sends a request and answers one challenge (`0x41`) by sending it again with the challenge.
+/// Returns the reply after its type byte, which must be `expect`.
+async fn a2s_exchange(
+    socket: &UdpSocket,
+    kind: u8,
+    payload: &[u8],
+    mut challenge: Option<[u8; 4]>,
+    expect: u8,
+) -> anyhow::Result<Vec<u8>> {
+    for _ in 0..2 {
+        let mut request = vec![0xff, 0xff, 0xff, 0xff, kind];
+        request.extend(payload);
+        request.extend(challenge.iter().flatten());
+        socket.send(&request).await?;
+        let mut reply = vec![0; 65_535];
+        let length = socket.recv(&mut reply).await?;
+        reply.truncate(length);
+        // ponytail: split replies (0xFFFFFFFE) are not joined; they only occur beyond ~1400 bytes,
+        // far more players than these servers hold.
+        let body = reply
+            .strip_prefix(&[0xff, 0xff, 0xff, 0xff])
+            .context("not a single-packet reply")?;
+        match body.split_first() {
+            Some((0x41, rest)) => {
+                challenge = Some(rest.get(..4).context("short challenge")?.try_into()?);
+            }
+            Some((&kind, rest)) if kind == expect => return Ok(rest.to_vec()),
+            _ => bail!("unexpected reply"),
+        }
+    }
+    bail!("challenge not accepted")
+}
+
+/// A2S_INFO reply: protocol, name, map, folder, game, app ID, players, max players, …
+fn parse_a2s_info(mut reply: &[u8]) -> anyhow::Result<(u32, u32)> {
+    take(&mut reply, 1)?;
+    for _ in 0..4 {
+        c_string(&mut reply)?;
+    }
+    take(&mut reply, 2)?;
+    let counts = take(&mut reply, 2)?;
+    Ok((counts[0].into(), counts[1].into()))
+}
+
+/// A2S_PLAYER reply: count, then index, name, score and duration per player.
+fn parse_a2s_players(mut reply: &[u8]) -> anyhow::Result<Vec<String>> {
+    let count = take(&mut reply, 1)?[0];
+    let mut names = Vec::new();
+    for _ in 0..count {
+        take(&mut reply, 1)?;
+        let name = c_string(&mut reply)?;
+        take(&mut reply, 8)?;
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn take<'a>(input: &mut &'a [u8], n: usize) -> anyhow::Result<&'a [u8]> {
+    ensure!(input.len() >= n, "truncated reply");
+    let (head, rest) = input.split_at(n);
+    *input = rest;
+    Ok(head)
+}
+
+fn c_string(input: &mut &[u8]) -> anyhow::Result<String> {
+    let end = input
+        .iter()
+        .position(|&b| b == 0)
+        .context("truncated reply")?;
+    let text = String::from_utf8_lossy(&input[..end]).into_owned();
+    *input = &input[end + 1..];
+    Ok(text)
 }
 
 pub(crate) fn write_varint(mut value: u32, out: &mut Vec<u8>) {
@@ -158,5 +253,47 @@ mod tests {
         let players = minecraft(port).await.unwrap();
         assert_eq!((players.online, players.max), (1, 10));
         assert_eq!(players.names, vec!["Anil".to_string()]);
+    }
+
+    /// A fake Steam server that wants a challenge for both requests, with packets as Valheim
+    /// sends them: two players online, one of them without a name.
+    #[tokio::test]
+    async fn asks_a_steam_server() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let header = [0xff, 0xff, 0xff, 0xff];
+            let challenge = [0x01, 0x02, 0x03, 0x04];
+            let mut info = header.to_vec();
+            info.extend(b"\x49\x11My world\0\0valheim\0Valheim\0\0\0\x02\x0a\0dl\0\x01");
+            let mut players = header.to_vec();
+            players.extend(b"\x44\x02");
+            players.extend(b"\0Anil\0\0\0\0\0\0\0\x80\x3f");
+            players.extend(b"\x01\0\0\0\0\0\0\0\x80\x3f");
+            let mut buf = [0u8; 1400];
+            loop {
+                let (n, from) = server.recv_from(&mut buf).await.unwrap();
+                let request = &buf[..n];
+                let reply = if request.ends_with(&challenge) {
+                    if request[4] == 0x54 { &info } else { &players }
+                } else {
+                    let mut c = header.to_vec();
+                    c.push(0x41);
+                    c.extend(challenge);
+                    server.send_to(&c, from).await.unwrap();
+                    continue;
+                };
+                server.send_to(reply, from).await.unwrap();
+            }
+        });
+        let players = a2s(port).await.unwrap();
+        assert_eq!(
+            players,
+            Players {
+                online: 2,
+                max: 10,
+                names: vec!["Anil".into()]
+            }
+        );
     }
 }

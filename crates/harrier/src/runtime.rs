@@ -12,16 +12,17 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use harrier_protocol::{
     AgentMessage, BackupAction, BackupRef, BackupResult, ConsoleOutput, CreateBackup, DownloadFile,
-    FileEntry, FileResult, MovePath, PathRequest, PortProtocol, QueryProtocol, QuerySpec, Quiesce,
-    ReadFile, Restart, RestoreBackup, RuntimeSpec, ServerPlayers, ServerRequest, ServerState,
-    ServerStats, ServerStatus, SleepSpec, Transfer, WakeProtocol, WriteFile,
+    FileEntry, FileResult, InstallSpec, MovePath, PathRequest, PortProtocol, QueryProtocol,
+    QuerySpec, Quiesce, ReadFile, Restart, RestoreBackup, RuntimeSpec, ServerPlayers,
+    ServerRequest, ServerState, ServerStats, ServerStatus, SleepSpec, Transfer, WakeProtocol,
+    WriteFile,
 };
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 // ponytail: Unix only (container user = owner of the data directory); Windows agents come with
 // `runtime: native` (ADR 0005)
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -134,6 +135,20 @@ impl Lines {
         }
         lines
     }
+}
+
+/// `/a/b`: absolute, no empty, `.` or `..` parts, and nothing Docker reads as bind options.
+fn is_plain_absolute_path(path: &str) -> bool {
+    path.strip_prefix('/').is_some_and(|rest| {
+        rest.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
+    })
 }
 
 fn container_name(server_id: &str) -> String {
@@ -264,23 +279,19 @@ impl Runtime {
             anyhow::bail!("The server is already running");
         }
         let name = container_name(server_id);
-
-        self.state(
-            server_id,
-            ServerStatus::Installing,
-            Some(format!("Pulling {}", spec.image)),
+        let mount_path = spec.mount_path.as_deref().unwrap_or("/data");
+        anyhow::ensure!(
+            is_plain_absolute_path(mount_path),
+            "Invalid mount path {mount_path:?}"
         );
-        let mut pull = self.docker.create_image(
-            Some(CreateImageOptions {
-                from_image: Some(spec.image.clone()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(progress) = pull.next().await {
-            progress.with_context(|| format!("Pulling {}", spec.image))?;
+        if let Some(signal) = &spec.stop_signal {
+            anyhow::ensure!(
+                ["SIGINT", "SIGTERM"].contains(&signal.as_str()),
+                "Unsupported stop signal {signal:?}"
+            );
         }
+
+        self.pull(server_id, &spec.image).await?;
 
         // Recreate the container so it always matches the current spec; data lives outside it.
         let _ = self
@@ -297,6 +308,12 @@ impl Runtime {
         let data = self.data_dir.join(server_id);
         std::fs::create_dir_all(&data).with_context(|| format!("Creating {}", data.display()))?;
         let owner = std::fs::metadata(&data)?;
+        // The server runs as the owner of its data directory, never as root.
+        let user = format!("{}:{}", owner.uid(), owner.gid());
+        if let Some(install) = &spec.install {
+            self.install(server_id, install, &spec, &data, &user)
+                .await?;
+        }
 
         let mut port_bindings = HashMap::new();
         let mut exposed = Vec::new();
@@ -331,13 +348,14 @@ impl Runtime {
             env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
             exposed_ports: Some(exposed),
             labels: Some(labels),
-            // The server runs as the owner of its data directory, never as root.
-            user: Some(format!("{}:{}", owner.uid(), owner.gid())),
+            user: Some(user),
+            // Docker sends it on stop, also when the server goes to sleep.
+            stop_signal: spec.stop_signal.clone(),
             tty: Some(true),
             open_stdin: Some(true),
             attach_stdin: Some(true),
             host_config: Some(HostConfig {
-                binds: Some(vec![format!("{}:/data", data.display())]),
+                binds: Some(vec![format!("{}:{mount_path}", data.display())]),
                 port_bindings: Some(port_bindings),
                 memory: Some(i64::from(spec.memory_mb) * 1024 * 1024),
                 pids_limit: Some(1024),
@@ -378,6 +396,167 @@ impl Runtime {
             }
         });
         Ok(())
+    }
+
+    async fn pull(&self, server_id: &str, image: &str) -> anyhow::Result<()> {
+        self.state(
+            server_id,
+            ServerStatus::Installing,
+            Some(format!("Pulling {image}")),
+        );
+        let mut pull = self.docker.create_image(
+            Some(CreateImageOptions {
+                from_image: Some(image.to_string()),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(progress) = pull.next().await {
+            progress.with_context(|| format!("Pulling {image}"))?;
+        }
+        Ok(())
+    }
+
+    /// Runs the install script (ADR 0022): as root with Docker's default capabilities but no new
+    /// privileges, and with only the data directory mounted. Afterwards every file is handed back
+    /// to `user`, so the server itself never needs root.
+    async fn install(
+        &self,
+        server_id: &str,
+        install: &InstallSpec,
+        spec: &RuntimeSpec,
+        data: &Path,
+        user: &str,
+    ) -> anyhow::Result<()> {
+        self.pull(server_id, &install.image).await?;
+        let name = format!("{}-install", container_name(server_id));
+        let remove = || {
+            self.docker.remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+        };
+        let _ = remove().await;
+        let result = self
+            .run_install(server_id, &name, install, spec, data, user)
+            .await;
+        let _ = remove().await;
+        result
+    }
+
+    async fn run_install(
+        &self,
+        server_id: &str,
+        name: &str,
+        install: &InstallSpec,
+        spec: &RuntimeSpec,
+        data: &Path,
+        user: &str,
+    ) -> anyhow::Result<()> {
+        // The script runs in a shell of its own, so `exit` or `set -e` in it cannot skip the
+        // chown. Eggs are often saved with Windows line endings.
+        let wrapper =
+            format!("\"$0\" -c \"$1\"\nstatus=$?; chown -R {user} /mnt/server; exit $status");
+        let body = ContainerCreateBody {
+            image: Some(install.image.clone()),
+            entrypoint: Some(vec![
+                install.entrypoint.clone(),
+                "-c".into(),
+                wrapper,
+                install.entrypoint.clone(),
+                install.script.replace("\r\n", "\n"),
+            ]),
+            env: Some(spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            user: Some("root".into()),
+            host_config: Some(HostConfig {
+                binds: Some(vec![format!("{}:/mnt/server", data.display())]),
+                memory: Some(i64::from(spec.memory_mb) * 1024 * 1024),
+                security_opt: Some(vec!["no-new-privileges".into()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: Some(name.to_string()),
+                    ..Default::default()
+                }),
+                body,
+            )
+            .await
+            .context("Creating the install container")?;
+        let mut output = self
+            .docker
+            .attach_container(
+                name,
+                Some(AttachContainerOptions {
+                    stdout: true,
+                    stderr: true,
+                    stream: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .output;
+        self.state(
+            server_id,
+            ServerStatus::Installing,
+            Some("Running the install script".into()),
+        );
+        self.docker
+            .start_container(name, None)
+            .await
+            .context("Starting the install container")?;
+
+        // Attached before the start: the output begins at a line start.
+        let mut lines = Lines {
+            tail: String::new(),
+            resync: false,
+        };
+        let mut last = VecDeque::new();
+        while let Some(Ok(chunk)) = output.next().await {
+            let data = String::from_utf8_lossy(&chunk.into_bytes()).into_owned();
+            for line in lines.push(&data) {
+                if last.len() == 10 {
+                    last.pop_front();
+                }
+                last.push_back(line);
+            }
+            self.emit(AgentMessage::ConsoleOutput(ConsoleOutput {
+                server_id: server_id.to_string(),
+                data,
+            }));
+        }
+        let code = self.exit_code(name).await;
+        if code != 0 {
+            last.push_back(lines.tail);
+            let output = Vec::from(last).join("\n");
+            anyhow::bail!(
+                "The install script exited with code {code}:\n{}",
+                output.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Waits for the container to exit; -1 if that cannot be known.
+    async fn exit_code(&self, name: &str) -> i64 {
+        match self
+            .docker
+            .wait_container(name, None::<WaitContainerOptions>)
+            .next()
+            .await
+        {
+            Some(Ok(r)) => r.status_code,
+            // bollard reports a non-zero exit code as an error
+            Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+            _ => -1,
+        }
     }
 
     /// Streams console output and stats until the container exits, then reports the result.
@@ -452,17 +631,7 @@ impl Runtime {
                 .run_once(server_id, running, ready.clone(), query.clone(), idle)
                 .await?;
 
-            let exit = self
-                .docker
-                .wait_container(&name, None::<WaitContainerOptions>)
-                .next()
-                .await;
-            let code = match exit {
-                Some(Ok(r)) => r.status_code,
-                // bollard reports a non-zero exit code as an error
-                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
-                _ => -1,
-            };
+            let code = self.exit_code(&name).await;
             if running.stopping.load(Ordering::SeqCst) {
                 info!("Server {server_id} stopped");
                 self.state(server_id, ServerStatus::Stopped, None);
@@ -658,6 +827,7 @@ impl Runtime {
             tick.tick().await;
             let result = match query.protocol {
                 QueryProtocol::Minecraft => query::minecraft(query.port).await,
+                QueryProtocol::A2s => query::a2s(query.port).await,
                 QueryProtocol::Unsupported => return,
             };
             let Ok(players) = result else { continue };
@@ -749,7 +919,7 @@ impl Runtime {
         !running.stopping.load(Ordering::SeqCst)
     }
 
-    /// Stops gracefully: Docker sends SIGTERM and kills the process after the timeout.
+    /// Stops gracefully: Docker sends the stop signal (SIGTERM unless the spec says otherwise) and kills the process after the timeout.
     pub async fn stop(self: Arc<Self>, server_id: String) {
         let running = self.servers.lock().unwrap().get(&server_id).cloned();
         let Some(running) = running else {
@@ -1249,6 +1419,75 @@ mod tests {
         assert!(!matches(&"x".repeat(Lines::MAX + 1)));
         assert!(!matches(system));
         assert!(matches(system));
+    }
+
+    /// Needs Docker: `cargo test -p harrier -- --ignored install`.
+    #[tokio::test]
+    #[ignore]
+    async fn install_runs_as_root_and_hands_the_files_back() {
+        let data = std::env::temp_dir().join(format!("harrier-install-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let owner = std::fs::metadata(&data).unwrap();
+        let user = format!("{}:{}", owner.uid(), owner.gid());
+        let (events, _rx) = mpsc::channel(1024);
+        let runtime = Runtime::new(std::env::temp_dir(), events, "", "").unwrap();
+        let spec: RuntimeSpec = serde_json::from_value(serde_json::json!({
+            "image": "unused", "env": {"GREETING": "hi"}, "ports": [], "memoryMb": 256,
+            "stopTimeoutSecs": 10
+        }))
+        .unwrap();
+        let install = |script: &str| InstallSpec {
+            image: "ghcr.io/parkervcp/installers:debian".into(),
+            entrypoint: "bash".into(),
+            script: script.into(),
+        };
+
+        let script = "id -u > /mnt/server/uid\r\necho $GREETING > /mnt/server/x\r\nexit 0";
+        runtime
+            .install("test", &install(script), &spec, &data, &user)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(data.join("uid")).unwrap(), "0\n");
+        assert_eq!(std::fs::read_to_string(data.join("x")).unwrap(), "hi\n");
+
+        // Ownership as containers see it (Docker Desktop shows the host user for every file).
+        let script = "stat -c %u:%g /mnt/server/x > /mnt/server/owner\nset -e\necho boom\nfalse";
+        let error = runtime
+            .install("test", &install(script), &spec, &data, &user)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "The install script exited with code 1:\nboom"
+        );
+        let leftover = runtime
+            .docker
+            .inspect_container("harrier-test-install", None)
+            .await;
+        assert!(leftover.is_err(), "the install container is removed");
+        let seen = std::fs::read_to_string(data.join("owner")).unwrap();
+        assert_eq!(seen.trim(), user);
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn mount_paths_are_plain_absolute_paths() {
+        for ok in ["/data", "/home/container", "/a/b.c/d-e_f"] {
+            assert!(is_plain_absolute_path(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/",
+            "data",
+            "/a/",
+            "/a//b",
+            "/a/../etc",
+            "/./a",
+            "/data:ro",
+            "/a b",
+        ] {
+            assert!(!is_plain_absolute_path(bad), "{bad}");
+        }
     }
 
     #[test]
