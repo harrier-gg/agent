@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/harrier-gg/agent/compare/v0.6.0...v0.7.0) (2026-11-12)
+
+
+### Features
+
+* check SHA-256 on downloads ([#21](https://github.com/harrier-gg/agent/issues/21)) ([3426de7](https://github.com/harrier-gg/agent/commit/3426de7cb98488921f16a888a52c1bf7b5518602))
+* delete a stopped server with its data and backups ([#23](https://github.com/harrier-gg/agent/issues/23)) ([b64ee7a](https://github.com/harrier-gg/agent/commit/b64ee7aa3cd4db85e26d8cf31cc99595da5d673d))
+
 ## [0.6.0](https://github.com/harrier-gg/agent/compare/v0.5.0...v0.6.0) (2026-11-12)
 
 
