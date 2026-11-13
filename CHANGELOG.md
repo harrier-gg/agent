@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.0](https://github.com/harrier-gg/agent/compare/v0.7.0...v0.8.0) (2026-11-13)
+
+
+### Features
+
+* run egg install scripts, mount path, stop signal and A2S query ([#24](https://github.com/harrier-gg/agent/issues/24)) ([b5fc2cf](https://github.com/harrier-gg/agent/commit/b5fc2cf370e0241470d8c1ce60e9b1121926af50))
+* start a server from the local image when pulling fails ([#26](https://github.com/harrier-gg/agent/issues/26)) ([ac36b4c](https://github.com/harrier-gg/agent/commit/ac36b4cf84f467ea2654b032b1b59d7bd1ca8e7b))
+
 ## [0.7.0](https://github.com/harrier-gg/agent/compare/v0.6.0...v0.7.0) (2026-11-12)
 
 
