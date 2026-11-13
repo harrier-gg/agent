@@ -9,6 +9,11 @@
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value=='harrier' || @.name.value=='harrier-protocol')].version"
         }
       ],
       "include-component-in-tag": false
