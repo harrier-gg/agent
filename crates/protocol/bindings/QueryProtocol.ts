@@ -3,4 +3,4 @@
 /**
  * Network protocols for asking game servers, not games.
  */
-export type QueryProtocol = "minecraft";
+export type QueryProtocol = "minecraft" | "a2s";
