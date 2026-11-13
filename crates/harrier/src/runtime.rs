@@ -475,6 +475,10 @@ impl Runtime {
             host_config: Some(HostConfig {
                 binds: Some(vec![format!("{}:/mnt/server", data.display())]),
                 memory: Some(i64::from(spec.memory_mb) * 1024 * 1024),
+                pids_limit: Some(1024),
+                // No device nodes: after the chown, the host user could open one in the data
+                // directory. No raw sockets either; installs only download.
+                cap_drop: Some(vec!["MKNOD".into(), "NET_RAW".into()]),
                 security_opt: Some(vec!["no-new-privileges".into()]),
                 ..Default::default()
             }),
@@ -1451,7 +1455,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(data.join("x")).unwrap(), "hi\n");
 
         // Ownership as containers see it (Docker Desktop shows the host user for every file).
-        let script = "stat -c %u:%g /mnt/server/x > /mnt/server/owner\nset -e\necho boom\nfalse";
+        let script = "stat -c %u:%g /mnt/server/x > /mnt/server/owner\nmknod /mnt/server/sda b 8 0 2>/dev/null && echo mknod\nset -e\necho boom\nfalse";
         let error = runtime
             .install("test", &install(script), &spec, &data, &user)
             .await
