@@ -413,7 +413,15 @@ impl Runtime {
             None,
         );
         while let Some(progress) = pull.next().await {
-            progress.with_context(|| format!("Pulling {image}"))?;
+            if let Err(e) = progress {
+                // A copy already on this machine still runs, e.g. while the registry is down or
+                // has no build for this platform but one was pulled for another.
+                if self.docker.inspect_image(image).await.is_ok() {
+                    warn!("Pulling {image} failed, using the local copy: {e}");
+                    return Ok(());
+                }
+                return Err(e).with_context(|| format!("Pulling {image}"));
+            }
         }
         Ok(())
     }
@@ -1423,6 +1431,37 @@ mod tests {
         assert!(!matches(&"x".repeat(Lines::MAX + 1)));
         assert!(!matches(system));
         assert!(matches(system));
+    }
+
+    /// Needs Docker: `cargo test -p harrier -- --ignored pull`.
+    #[tokio::test]
+    #[ignore]
+    async fn pull_falls_back_to_a_local_copy() {
+        let (events, _rx) = mpsc::channel(1024);
+        let runtime = Runtime::new(std::env::temp_dir(), events, "", "").unwrap();
+        runtime.pull("test", "busybox:1.36").await.unwrap();
+        // A name no registry has, but this machine does.
+        runtime
+            .docker
+            .tag_image(
+                "busybox:1.36",
+                Some(bollard::query_parameters::TagImageOptions {
+                    repo: Some("harrier-test/local-only".into()),
+                    tag: Some("1".into()),
+                }),
+            )
+            .await
+            .unwrap();
+        runtime
+            .pull("test", "harrier-test/local-only:1")
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .pull("test", "harrier-test/missing:1")
+                .await
+                .is_err()
+        );
     }
 
     /// Needs Docker: `cargo test -p harrier -- --ignored install`.
