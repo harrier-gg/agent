@@ -91,8 +91,10 @@ pub struct Runtime {
     token: String,
 }
 
-/// With an agent running as root, games run as this unprivileged user instead.
-const SERVER_UID: u32 = 1000;
+/// With an agent running as root, games run as this unprivileged user instead. Not 1000, which on
+/// most hosts is the admin's own login, so an escaped game would not get into their home.
+/// ponytail: one uid for all servers; a uid per server if they should be kept apart on the host too
+const SERVER_UID: u32 = 50_000;
 
 /// The user a server runs as: never root. An agent running as root hands the server's files to
 /// `SERVER_UID` first, also files it wrote itself since (downloads, restores); otherwise the
@@ -107,7 +109,8 @@ fn server_owner(data: &Path) -> std::io::Result<(u32, u32)> {
 }
 
 /// `chown -R` that never follows symlinks, so a link in the server's files can't hand over
-/// anything outside them.
+/// anything outside them. Nothing writes to the directory meanwhile: the start holds the server's
+/// claim, so neither the game, its install nor a restore runs.
 fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
     if std::fs::symlink_metadata(path)?.is_dir() {
@@ -338,6 +341,8 @@ impl Runtime {
             }
             anyhow::bail!("The server is already running");
         }
+        // The same ID check as every other handler: the files below are chowned as root.
+        let data = self.server_dir(server_id).map_err(anyhow::Error::msg)?;
         let claim = self
             .claim(server_id, "starting")
             .map_err(anyhow::Error::msg)?;
@@ -368,7 +373,6 @@ impl Runtime {
             )
             .await;
 
-        let data = self.data_dir.join(server_id);
         std::fs::create_dir_all(&data).with_context(|| format!("Creating {}", data.display()))?;
         let (uid, gid) = {
             let dir = data.clone();
