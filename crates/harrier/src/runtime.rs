@@ -91,6 +91,33 @@ pub struct Runtime {
     token: String,
 }
 
+/// With an agent running as root, games run as this unprivileged user instead.
+const SERVER_UID: u32 = 1000;
+
+/// The user a server runs as: never root. An agent running as root hands the server's files to
+/// `SERVER_UID` first, also files it wrote itself since (downloads, restores); otherwise the
+/// server runs as the owner of its data directory, which is the agent's own user.
+fn server_owner(data: &Path) -> std::io::Result<(u32, u32)> {
+    if !rustix::process::geteuid().is_root() {
+        let owner = std::fs::metadata(data)?;
+        return Ok((owner.uid(), owner.gid()));
+    }
+    chown_tree(data, SERVER_UID, SERVER_UID)?;
+    Ok((SERVER_UID, SERVER_UID))
+}
+
+/// `chown -R` that never follows symlinks, so a link in the server's files can't hand over
+/// anything outside them.
+fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
 /// A server claimed by a start, restore or delete until dropped. A start keeps its claim until
 /// the server is registered as running, so a restore can't slip in between (agent#30).
 struct Claim {
@@ -343,9 +370,13 @@ impl Runtime {
 
         let data = self.data_dir.join(server_id);
         std::fs::create_dir_all(&data).with_context(|| format!("Creating {}", data.display()))?;
-        let owner = std::fs::metadata(&data)?;
-        // The server runs as the owner of its data directory, never as root.
-        let user = format!("{}:{}", owner.uid(), owner.gid());
+        let (uid, gid) = {
+            let dir = data.clone();
+            tokio::task::spawn_blocking(move || server_owner(&dir))
+                .await?
+                .with_context(|| format!("Handing {} to the server's user", data.display()))?
+        };
+        let user = format!("{uid}:{gid}");
         if let Some(install) = &spec.install {
             self.install(server_id, install, &spec, &data, &user)
                 .await?;
@@ -394,6 +425,8 @@ impl Runtime {
                 binds: Some(vec![format!("{}:{mount_path}", data.display())]),
                 port_bindings: Some(port_bindings),
                 memory: Some(i64::from(spec.memory_mb) * 1024 * 1024),
+                // The limit includes swap; Docker would otherwise allow as much again on top.
+                memory_swap: Some(i64::from(spec.memory_mb) * 1024 * 1024),
                 pids_limit: Some(1024),
                 cap_drop: Some(vec!["ALL".into()]),
                 security_opt: Some(vec!["no-new-privileges".into()]),
@@ -527,6 +560,8 @@ impl Runtime {
             host_config: Some(HostConfig {
                 binds: Some(vec![format!("{}:/mnt/server", data.display())]),
                 memory: Some(i64::from(spec.memory_mb) * 1024 * 1024),
+                // The limit includes swap; Docker would otherwise allow as much again on top.
+                memory_swap: Some(i64::from(spec.memory_mb) * 1024 * 1024),
                 pids_limit: Some(1024),
                 // No device nodes: after the chown, the host user could open one in the data
                 // directory. No raw sockets either; installs only download.
@@ -1482,6 +1517,42 @@ mod tests {
         assert!(!matches(&"x".repeat(Lines::MAX + 1)));
         assert!(!matches(system));
         assert!(matches(system));
+    }
+
+    #[test]
+    fn servers_run_as_the_agent_user_unless_it_is_root() {
+        let data = std::env::temp_dir().join(format!("harrier-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let me = std::fs::metadata(&data).unwrap();
+        if !rustix::process::geteuid().is_root() {
+            assert_eq!(server_owner(&data).unwrap(), (me.uid(), me.gid()));
+        }
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    /// Needs root: `sudo cargo test -p harrier -- --ignored chown`, or in a Linux container.
+    #[test]
+    #[ignore]
+    fn a_root_agent_hands_server_files_to_an_unprivileged_user() {
+        assert!(rustix::process::geteuid().is_root(), "run as root");
+        let base = std::env::temp_dir().join(format!("harrier-chown-{}", std::process::id()));
+        let (data, outside) = (base.join("server"), base.join("outside"));
+        std::fs::create_dir_all(data.join("BepInEx/plugins")).unwrap();
+        std::fs::write(data.join("BepInEx/plugins/mod.dll"), "x").unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, data.join("link")).unwrap();
+
+        assert_eq!(server_owner(&data).unwrap(), (SERVER_UID, SERVER_UID));
+        for path in [data.clone(), data.join("BepInEx/plugins/mod.dll")] {
+            assert_eq!(std::fs::metadata(path).unwrap().uid(), SERVER_UID);
+        }
+        // The link itself changes hands, never what it points to.
+        assert_eq!(
+            std::fs::symlink_metadata(data.join("link")).unwrap().uid(),
+            SERVER_UID
+        );
+        assert_eq!(std::fs::metadata(&outside).unwrap().uid(), 0);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[tokio::test]
