@@ -13,6 +13,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tracing::{error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// The agent pings the panel this often; any frame from the panel (also its pong) counts as alive.
+const PING_EVERY: Duration = Duration::from_secs(30);
+/// Without a frame from the panel for this long, the connection died silently: reconnect.
+const PANEL_SILENCE: Duration = Duration::from_secs(90);
 /// Close code the panel uses when another connection with the same token took over (ADR 0004).
 const CLOSE_REPLACED: u16 = 4002;
 
@@ -93,6 +97,11 @@ async fn session(
     // Events collected while disconnected are stale; the current state is reported after welcome.
     while events.try_recv().is_ok() {}
 
+    // A panel that vanished without closing (power loss, NAT timeout) never sends a close; the
+    // agent would wait forever. The panel answers pings, so silence means the connection is dead.
+    let silence = tokio::time::sleep(PANEL_SILENCE);
+    tokio::pin!(silence);
+    let mut ping = tokio::time::interval(PING_EVERY);
     loop {
         let msg = tokio::select! {
             msg = ws.next() => match msg {
@@ -105,7 +114,17 @@ async fn session(
                 }
                 continue;
             }
+            _ = ping.tick() => {
+                ws.send(Message::Ping(Default::default())).await?;
+                continue;
+            }
+            () = &mut silence => {
+                anyhow::bail!("No answer from the panel for {}s", PANEL_SILENCE.as_secs());
+            }
         };
+        silence
+            .as_mut()
+            .reset(tokio::time::Instant::now() + PANEL_SILENCE);
         let text = match msg {
             Message::Text(text) => text,
             Message::Close(Some(frame)) if u16::from(frame.code) == CLOSE_REPLACED => {
