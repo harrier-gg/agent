@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.0](https://github.com/harrier-gg/agent/compare/v0.7.0...v0.8.0) (2026-11-15)
+
+
+### Features
+
+* run egg install scripts, mount path, stop signal and A2S query ([#24](https://github.com/harrier-gg/agent/issues/24)) ([b5fc2cf](https://github.com/harrier-gg/agent/commit/b5fc2cf370e0241470d8c1ce60e9b1121926af50))
+* start a server from the local image when pulling fails ([#26](https://github.com/harrier-gg/agent/issues/26)) ([ac36b4c](https://github.com/harrier-gg/agent/commit/ac36b4cf84f467ea2654b032b1b59d7bd1ca8e7b))
+* static Linux binaries for x86-64 and ARM64 on every release ([#36](https://github.com/harrier-gg/agent/issues/36)) ([c2993e6](https://github.com/harrier-gg/agent/commit/c2993e69041e58add9ff72d8797f1f29af44bd25))
+* unpack verified zip downloads into a folder ([#29](https://github.com/harrier-gg/agent/issues/29)) ([c3ed89f](https://github.com/harrier-gg/agent/commit/c3ed89fa2389fe4ebbdb1144f4d9b7ef63b91a1f))
+
+
+### Bug Fixes
+
+* never let a start, restore or delete of one server overlap ([#31](https://github.com/harrier-gg/agent/issues/31)) ([7bb392c](https://github.com/harrier-gg/agent/commit/7bb392cb5959738694707fa9a3647d9fb0068945))
+* never run games as root, and count swap in the memory limit ([#35](https://github.com/harrier-gg/agent/issues/35)) ([d62a46c](https://github.com/harrier-gg/agent/commit/d62a46cde785f363292f42e580c3c82a95375e58))
+* ping the panel and reconnect when it stays silent for 90 s ([#34](https://github.com/harrier-gg/agent/issues/34)) ([98146c8](https://github.com/harrier-gg/agent/commit/98146c860bd795ff08a2b505e58f30648d375557))
+
 ## [0.7.0](https://github.com/harrier-gg/agent/compare/v0.6.0...v0.7.0) (2026-11-12)
 
 
