@@ -84,9 +84,24 @@ pub struct Runtime {
     servers: Mutex<HashMap<String, Arc<Running>>>,
     /// Servers with a backup or restore in progress; one at a time per server (ADR 0016).
     backing_up: Mutex<HashSet<String>>,
+    /// Servers being started, restored or deleted, with what is happening: these never overlap.
+    busy: Mutex<HashMap<String, &'static str>>,
     /// Panel URL and agent token, for transfer channels (ADR 0015).
     panel: String,
     token: String,
+}
+
+/// A server claimed by a start, restore or delete until dropped. A start keeps its claim until
+/// the server is registered as running, so a restore can't slip in between (agent#30).
+struct Claim {
+    runtime: Arc<Runtime>,
+    server_id: String,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.runtime.busy.lock().unwrap().remove(&self.server_id);
+    }
 }
 
 /// Cuts console output into whole lines. Console output is untrusted: players can write anything
@@ -169,9 +184,26 @@ impl Runtime {
             events,
             servers: Mutex::new(HashMap::new()),
             backing_up: Mutex::new(HashSet::new()),
+            busy: Mutex::new(HashMap::new()),
             panel: panel.to_string(),
             token: token.to_string(),
         }))
+    }
+
+    /// Claims a server for `what` ("starting", "being restored", "being deleted"), or says what
+    /// it is busy with.
+    fn claim(self: &Arc<Self>, server_id: &str, what: &'static str) -> Result<Claim, String> {
+        let mut busy = self.busy.lock().unwrap();
+        if let Some(other) = busy.get(server_id) {
+            return Err(format!(
+                "The server is {other}; try again when that is done"
+            ));
+        }
+        busy.insert(server_id.to_string(), what);
+        Ok(Claim {
+            runtime: self.clone(),
+            server_id: server_id.to_string(),
+        })
     }
 
     /// Sends an event to the panel. While disconnected the channel fills up and events are
@@ -249,6 +281,7 @@ impl Runtime {
                         query,
                         sleep,
                         asleep,
+                        None,
                     )
                     .await
                 {
@@ -278,6 +311,9 @@ impl Runtime {
             }
             anyhow::bail!("The server is already running");
         }
+        let claim = self
+            .claim(server_id, "starting")
+            .map_err(anyhow::Error::msg)?;
         let name = container_name(server_id);
         let mount_path = spec.mount_path.as_deref().unwrap_or("/data");
         anyhow::ensure!(
@@ -389,7 +425,15 @@ impl Runtime {
         let id = server_id.to_string();
         tokio::spawn(async move {
             if let Err(e) = this
-                .supervise(&id, ready, timeout, spec.query, spec.sleep, false)
+                .supervise(
+                    &id,
+                    ready,
+                    timeout,
+                    spec.query,
+                    spec.sleep,
+                    false,
+                    Some(claim),
+                )
                 .await
             {
                 warn!("Supervising {id} failed: {e:#}");
@@ -573,6 +617,7 @@ impl Runtime {
 
     /// Streams console output and stats until the container exits, then reports the result.
     /// Restarts crashed servers (ADR 0010) until they stop, keep crashing or are stopped.
+    #[allow(clippy::too_many_arguments)] // all of them describe this one supervised server
     async fn supervise(
         self: Arc<Self>,
         server_id: &str,
@@ -581,6 +626,7 @@ impl Runtime {
         query: Option<QuerySpec>,
         sleep: Option<SleepSpec>,
         asleep: bool,
+        claim: Option<Claim>,
     ) -> anyhow::Result<()> {
         let running = Arc::new(Running {
             stdin: tokio::sync::Mutex::new(None),
@@ -594,6 +640,8 @@ impl Runtime {
             .lock()
             .unwrap()
             .insert(server_id.to_string(), running.clone());
+        // Registered as running: restores and deletes now see it, so the start's claim can go.
+        drop(claim);
         let result = self
             .run_until_done(server_id, &running, ready, query, sleep, asleep)
             .await;
@@ -1140,6 +1188,7 @@ impl Runtime {
         let name = request.name;
         let exclude = request.exclude;
         let result = async {
+            let _claim = self.claim(&id, "being restored")?;
             if self.servers.lock().unwrap().contains_key(&id) {
                 return Err("Stop the server before restoring a backup".to_string());
             }
@@ -1302,6 +1351,7 @@ impl Runtime {
         let id = request.server_id;
         let result = async {
             let dir = self.server_dir(&id)?;
+            let _claim = self.claim(&id, "being deleted")?;
             if self.servers.lock().unwrap().contains_key(&id) {
                 return Err("Stop the server before deleting it".to_string());
             }
@@ -1432,6 +1482,43 @@ mod tests {
         assert!(!matches(&"x".repeat(Lines::MAX + 1)));
         assert!(!matches(system));
         assert!(matches(system));
+    }
+
+    #[tokio::test]
+    async fn start_restore_and_delete_never_overlap() {
+        let (events, mut rx) = mpsc::channel(1024);
+        let runtime = Runtime::new(std::env::temp_dir(), events, "", "").unwrap();
+        let id = "01a1e06d-7574-71e6-bc14-cfa019a8f040";
+
+        // A start in progress (pulling, installing) keeps a restore out (agent#30).
+        let starting = runtime.claim(id, "starting").unwrap();
+        runtime
+            .clone()
+            .restore_backup(RestoreBackup {
+                request_id: "r".into(),
+                server_id: id.into(),
+                name: "b".into(),
+                exclude: vec![],
+            })
+            .await;
+        let Some(AgentMessage::BackupResult(result)) = rx.recv().await else {
+            panic!("no backup result");
+        };
+        assert_eq!(
+            result.error.as_deref(),
+            Some("The server is starting; try again when that is done")
+        );
+
+        // And a restore keeps the start and a delete out; other servers are not affected.
+        drop(starting);
+        let restoring = runtime.claim(id, "being restored").unwrap();
+        assert_eq!(
+            runtime.claim(id, "starting").err().as_deref(),
+            Some("The server is being restored; try again when that is done")
+        );
+        assert!(runtime.claim("another", "starting").is_ok());
+        drop(restoring);
+        assert!(runtime.claim(id, "being deleted").is_ok());
     }
 
     /// Needs Docker: `cargo test -p harrier -- --ignored pull`.
