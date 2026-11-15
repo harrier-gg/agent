@@ -547,6 +547,7 @@ dependencies = [
  "harrier-protocol",
  "hex",
  "regex",
+ "rustix",
  "serde_json",
  "sha1 0.10.7",
  "sha2",
