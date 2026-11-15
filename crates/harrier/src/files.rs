@@ -17,7 +17,7 @@ const MAX_BYTES: u64 = 128 * 1024;
 
 /// Accepts only plain relative paths (`config/paper.yml`), so errors are clear before cap-std
 /// would refuse them anyway.
-fn relative(path: &str) -> Result<&Path, String> {
+pub(crate) fn relative(path: &str) -> Result<&Path, String> {
     let relative = Path::new(path);
     if path.is_empty()
         || !relative
@@ -29,7 +29,7 @@ fn relative(path: &str) -> Result<&Path, String> {
     Ok(relative)
 }
 
-fn open_root(root: &Path) -> std::io::Result<Dir> {
+pub(crate) fn open_root(root: &Path) -> std::io::Result<Dir> {
     Dir::open_ambient_dir(root, ambient_authority())
 }
 
@@ -93,7 +93,7 @@ pub fn write(root: &Path, path: &str, content: &str) -> Result<(), String> {
 }
 
 /// Suffix of files being written; they are hidden from listings.
-const TEMP_SUFFIX: &str = ".harrier-tmp";
+pub(crate) const TEMP_SUFFIX: &str = ".harrier-tmp";
 
 /// A directory's entries, directories first, then by name. `""` lists the data directory itself,
 /// which may not exist before the first start (then it is empty).
@@ -238,7 +238,10 @@ pub fn start_upload(root: &Path, path: &str) -> Result<Upload, String> {
     let temp = parent.join(format!(".{name}.upload{TEMP_SUFFIX}"));
     let _ = dir.remove_file(&temp);
     let file = dir
-        .open_with(&temp, OpenOptions::new().write(true).create_new(true))
+        .open_with(
+            &temp,
+            OpenOptions::new().read(true).write(true).create_new(true),
+        )
         .map_err(failed)?
         .into_std();
     Ok(Upload {

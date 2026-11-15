@@ -116,6 +116,10 @@ pub struct DownloadFile {
     /// Hangar only publishes SHA-256.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// With `extract`, `path` is a folder (e.g. `BepInEx/plugins/Namespace-Name`) and the verified
+    /// file is a zip that is unpacked into it, replacing the folder (Thunderstore, ADR 0023).
+    #[serde(default)]
+    pub extract: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
