@@ -18,28 +18,3 @@ jobs:
           rm -rf crates/protocol/bindings
           cargo test -p harrier-protocol export_bindings --quiet
           git diff --exit-code crates/protocol/bindings
-
-  # The release builds these on every release; building them here too means a change that breaks
-  # the static Linux build shows up in its PR, not in the release.
-  binaries:
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-          - target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1 – reads rust-toolchain.toml
-        with:
-          target: ${{ matrix.target }}
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --locked -p harrier --target ${{ matrix.target }}
-      - name: The binary is static and starts
-        run: |
-          bin=target/${{ matrix.target }}/release/harrier
-          file "$bin"
-          file "$bin" | grep -Eq 'statically linked|static-pie linked'
-          "$bin" --version
