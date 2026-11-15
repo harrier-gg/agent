@@ -15,4 +15,9 @@ sha512: string | null, sha1: string | null,
 /**
  * Hangar only publishes SHA-256.
  */
-sha256: string | null, };
+sha256: string | null, 
+/**
+ * With `extract`, `path` is a folder (e.g. `BepInEx/plugins/Namespace-Name`) and the verified
+ * file is a zip that is unpacked into it, replacing the folder (Thunderstore, ADR 0023).
+ */
+extract: boolean | null, };
