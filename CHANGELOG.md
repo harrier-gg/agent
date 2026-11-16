@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.1](https://github.com/harrier-gg/agent/compare/v0.8.0...v0.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* a start of a running server changes nothing instead of reporting a crash ([#42](https://github.com/harrier-gg/agent/issues/42)) ([6433c2f](https://github.com/harrier-gg/agent/commit/6433c2f35378080832aa598ece18c3622005ff47))
+* keep file modes in backups, so restored binaries stay executable ([#40](https://github.com/harrier-gg/agent/issues/40)) ([52fcf8b](https://github.com/harrier-gg/agent/commit/52fcf8b4cbcf768059304dffdf132a973395c518))
+* start servers again that were running when the agent went down ([#41](https://github.com/harrier-gg/agent/issues/41)) ([c8ef8c6](https://github.com/harrier-gg/agent/commit/c8ef8c633741623e2679c79976ad5b52f3a81e80))
+
 ## [0.8.0](https://github.com/harrier-gg/agent/compare/v0.7.0...v0.8.0) (2026-11-15)
 
 
