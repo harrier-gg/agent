@@ -42,6 +42,9 @@ const SLEEP_LABEL: &str = "gg.harrier.sleep";
 const READY_LABEL: &str = "gg.harrier.ready";
 /// Marker files of sleeping servers, next to (never inside) the servers' data directories.
 const SLEEPING_DIR: &str = ".harrier-sleeping";
+/// Markers of servers the agent supervises as running. One left over when the agent comes up
+/// means the agent went down with the server, e.g. the node rebooted: start it again.
+const RUNNING_DIR: &str = ".harrier-running";
 const DEFAULT_STOP_TIMEOUT_SECS: i32 = 30;
 /// Waits before restarting a crashed server; its length is the number of attempts (ADR 0010).
 const RESTART_DELAYS_SECS: [u64; 3] = [10, 30, 60];
@@ -273,6 +276,9 @@ impl Runtime {
             else {
                 continue;
             };
+            if self.server_dir(&server_id).is_err() {
+                continue;
+            }
             let running = matches!(
                 container.state,
                 Some(bollard::models::ContainerSummaryStateEnum::RUNNING)
@@ -291,12 +297,37 @@ impl Runtime {
                 }
                 continue;
             }
+            let mut claim = None;
             if !running && !asleep {
-                self.state(&server_id, ServerStatus::Stopped, None);
-                continue;
+                if !self.run_marker(&server_id).exists() {
+                    self.state(&server_id, ServerStatus::Stopped, None);
+                    continue;
+                }
+                // The agent went down with the server (node reboot, Docker restart): start it
+                // again, the same container with the same spec.
+                let Ok(starting) = self.claim(&server_id, "starting") else {
+                    continue;
+                };
+                info!("Starting {server_id} again: it was running when the agent went down");
+                self.state(&server_id, ServerStatus::Starting, None);
+                if let Err(e) = self
+                    .docker
+                    .start_container(&container_name(&server_id), None)
+                    .await
+                {
+                    let _ = std::fs::remove_file(self.run_marker(&server_id));
+                    self.state(
+                        &server_id,
+                        ServerStatus::Crashed,
+                        Some(format!("Starting it again after a restart failed: {e}")),
+                    );
+                    continue;
+                }
+                claim = Some(starting);
             }
-            // A running server has printed its ready line long ago; a sleeping one will again.
-            let ready = if asleep {
+            // A running server has printed its ready line long ago; a sleeping or just started
+            // one will again.
+            let ready = if asleep || claim.is_some() {
                 label(READY_LABEL).and_then(|r| Regex::new(&r).ok())
             } else {
                 None
@@ -311,7 +342,7 @@ impl Runtime {
                         query,
                         sleep,
                         asleep,
-                        None,
+                        claim,
                     )
                     .await
                 {
@@ -681,9 +712,16 @@ impl Runtime {
             .insert(server_id.to_string(), running.clone());
         // Registered as running: restores and deletes now see it, so the start's claim can go.
         drop(claim);
+        let marker = self.run_marker(server_id);
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, "");
         let result = self
             .run_until_done(server_id, &running, ready, query, sleep, asleep)
             .await;
+        // Stopped, crashed for good or deleted while the agent ran: not to be started again.
+        let _ = std::fs::remove_file(&marker);
         self.servers.lock().unwrap().remove(server_id);
         if let Err(e) = &result {
             self.state(server_id, ServerStatus::Crashed, Some(format!("{e:#}")));
@@ -970,6 +1008,10 @@ impl Runtime {
 
     fn sleep_marker(&self, server_id: &str) -> PathBuf {
         self.data_dir.join(SLEEPING_DIR).join(server_id)
+    }
+
+    fn run_marker(&self, server_id: &str) -> PathBuf {
+        self.data_dir.join(RUNNING_DIR).join(server_id)
     }
 
     /// Waits while the server sleeps (ADR 0013): answers on its game port if the spec says how,
