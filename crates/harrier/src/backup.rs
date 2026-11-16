@@ -9,6 +9,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use harrier_protocol::{EntryKind, FileEntry};
 use std::fs::File;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 const BACKUPS_DIR: &str = ".harrier-backups";
@@ -104,22 +105,19 @@ fn append_dir(
             archive.append_data(&mut header, &path, std::io::empty())?;
             append_dir(archive, &dir.open_dir(&name)?, &path, &[])?;
         } else if kind.is_file() {
-            let file = dir.open(&name)?;
+            let file = dir.open(&name)?.into_std();
             let meta = file.metadata()?;
             let mut header = tar::Header::new_gnu();
             header.set_size(meta.len());
-            header.set_mode(0o644);
+            // Keeps executable bits (game binaries, start scripts), never setuid or setgid.
+            header.set_mode(meta.permissions().mode() & 0o777);
             let mtime = meta
                 .modified()
                 .ok()
-                .and_then(|t| t.into_std().duration_since(std::time::UNIX_EPOCH).ok());
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
             header.set_mtime(mtime.map_or(0, |d| d.as_secs()));
             // The game may still append to a log while it is copied: take exactly `len` bytes.
-            archive.append_data(
-                &mut header,
-                &path,
-                std::io::Read::take(file.into_std(), meta.len()),
-            )?;
+            archive.append_data(&mut header, &path, std::io::Read::take(file, meta.len()))?;
         }
     }
     Ok(())
@@ -252,6 +250,13 @@ mod tests {
         std::fs::write(server.join("minecraft_server.jar"), "jar").unwrap();
         std::fs::create_dir_all(server.join("plugins")).unwrap();
         std::fs::write(server.join("plugins/kept.jar"), "plugin").unwrap();
+        std::fs::create_dir_all(server.join("bin")).unwrap();
+        std::fs::write(server.join("bin/valheim_server.x86_64"), "elf").unwrap();
+        std::fs::set_permissions(
+            server.join("bin/valheim_server.x86_64"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let exclude = ["libraries".to_string(), "*.jar".to_string()];
         assert!(create(&server, &backups, name, &exclude).unwrap() > 0);
         let names: Vec<String> =
@@ -290,6 +295,15 @@ mod tests {
             100_000
         );
         assert!(!server.join("link").exists(), "symlinks are not backed up");
+        let mode = |p: &str| {
+            std::fs::metadata(server.join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("bin/valheim_server.x86_64"), 0o755, "still executable");
+        assert_eq!(mode("server.properties") & 0o111, 0, "not made executable");
 
         assert!(restore(&server, &backups, "../secret", &[]).is_err());
         assert!(remove(&backups, "x.tar.gz").is_err());
