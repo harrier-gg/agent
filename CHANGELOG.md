@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/harrier-gg/agent/compare/v0.8.1...v0.8.2) (2026-11-16)
+
+
+### Bug Fixes
+
+* give game containers a fresh /tmp, so yolk images work under any uid ([#45](https://github.com/harrier-gg/agent/issues/45)) ([352ed72](https://github.com/harrier-gg/agent/commit/352ed722d133e0c591d131642212a4c972ec8efc))
+
 ## [0.8.1](https://github.com/harrier-gg/agent/compare/v0.8.0...v0.8.1) (2026-11-16)
 
 

@@ -13,7 +13,7 @@ Every [release](https://github.com/harrier-gg/agent/releases) has static binarie
 
 ```bash
 arch=$(uname -m)   # x86_64 or aarch64
-tag=v0.8.1         # the release to install (x-release-please-version)
+tag=v0.8.2         # the release to install (x-release-please-version)
 file=harrier-$tag-$arch-unknown-linux-musl.tar.gz
 curl -fLO https://github.com/harrier-gg/agent/releases/download/$tag/$file
 curl -fLO https://github.com/harrier-gg/agent/releases/download/$tag/$file.sha256
