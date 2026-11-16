@@ -370,7 +370,10 @@ impl Runtime {
                 running.wake.notify_one();
                 return Ok(());
             }
-            anyhow::bail!("The server is already running");
+            // A second start (stale tab, two people at once) changes nothing. Not an error: that
+            // would report a healthy server as crashed. Its own state reports keep the panel right.
+            info!("{server_id} is already running");
+            return Ok(());
         }
         // The same ID check as every other handler: the files below are chowned as root.
         let data = self.server_dir(server_id).map_err(anyhow::Error::msg)?;
@@ -1599,6 +1602,31 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&outside).unwrap().uid(), 0);
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn starting_a_running_server_changes_nothing() {
+        let (events, mut rx) = mpsc::channel(1024);
+        let runtime = Runtime::new(std::env::temp_dir(), events, "", "").unwrap();
+        let id = "01a1e06d-7574-71e6-bc14-cfa019a8f041";
+        runtime.servers.lock().unwrap().insert(
+            id.into(),
+            Arc::new(Running {
+                stdin: tokio::sync::Mutex::new(None),
+                stopping: AtomicBool::new(false),
+                sleeping: AtomicBool::new(false),
+                wake: Notify::new(),
+                output: broadcast::channel(1).0,
+                stop_timeout_secs: 10,
+            }),
+        );
+        let spec = serde_json::from_value(serde_json::json!({
+            "image": "busybox", "env": {}, "ports": [], "memoryMb": 64, "stopTimeoutSecs": 10
+        }))
+        .unwrap();
+        runtime.clone().start(id.into(), spec).await;
+        // Before: "crashed" with "The server is already running".
+        assert!(rx.try_recv().is_err(), "no state reported");
     }
 
     #[tokio::test]
