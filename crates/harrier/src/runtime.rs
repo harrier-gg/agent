@@ -468,6 +468,14 @@ impl Runtime {
                 pids_limit: Some(1024),
                 cap_drop: Some(vec!["ALL".into()]),
                 security_opt: Some(vec!["no-new-privileges".into()]),
+                // A fresh, writable /tmp, as Pterodactyl's Wings gives every container. Yolk
+                // images write the passwd entry for the running uid to /tmp/passwd (nss_wrapper);
+                // in the image that file belongs to root, so any other uid can't, and games that
+                // look their user up crash (Valheim). Counts against the memory limit.
+                tmpfs: Some(HashMap::from([(
+                    "/tmp".to_string(),
+                    "rw,exec,nosuid,nodev,size=100m".to_string(),
+                )])),
                 init: Some(true),
                 ..Default::default()
             }),
