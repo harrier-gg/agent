@@ -13,7 +13,7 @@ Every [release](https://github.com/harrier-gg/agent/releases) has static binarie
 
 ```bash
 arch=$(uname -m)   # x86_64 or aarch64
-tag=v0.9.0         # the release to install
+tag=v0.8.1         # the release to install (x-release-please-version)
 file=harrier-$tag-$arch-unknown-linux-musl.tar.gz
 curl -fLO https://github.com/harrier-gg/agent/releases/download/$tag/$file
 curl -fLO https://github.com/harrier-gg/agent/releases/download/$tag/$file.sha256
@@ -39,7 +39,7 @@ just check      # everything CI checks
 
 The token never travels unencrypted over a network: the panel URL must use `wss://`, except for the own machine (`ws://localhost`). For a panel in a trusted home network without HTTPS, pass `--insecure` (or set `HARRIER_AGENT_INSECURE=true`); the agent warns on every start.
 
-**Servers** run as Docker containers named `harrier-<serverId>` (Docker must be running). Each server keeps its data in its own directory under `~/.local/share/harrier/servers` (`--data-dir` / `HARRIER_DATA_DIR`); the container runs as the owner of that directory (or, when the agent runs as root, as uid 50000, which gets the directory first), without capabilities, with `no-new-privileges` and the memory limit from the panel (swap included). Containers keep running while the agent restarts; the agent re-attaches to them.
+**Servers** run as Docker containers named `harrier-<serverId>` (Docker must be running). Each server keeps its data in its own directory under `~/.local/share/harrier/servers` (`--data-dir` / `HARRIER_DATA_DIR`); the container runs as the owner of that directory (or, when the agent runs as root, as uid 50000, which gets the directory first), without capabilities, with `no-new-privileges`, a fresh 100 MB `/tmp` (tmpfs, as Pterodactyl's Wings does) and the memory limit from the panel (swap included). Containers keep running while the agent restarts; the agent re-attaches to them.
 
 Exit code 2 means the panel rejected the agent for good (invalid token, unsupported protocol, or another agent took over the same token); restarting will not help.
 

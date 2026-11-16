@@ -14,6 +14,10 @@
           "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value=='harrier' || @.name.value=='harrier-protocol')].version"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
         }
       ],
       "include-component-in-tag": false
