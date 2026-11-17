@@ -120,6 +120,23 @@ pub struct DownloadFile {
     /// file is a zip that is unpacked into it, replacing the folder (Thunderstore, ADR 0023).
     #[serde(default)]
     pub extract: Option<bool>,
+    /// With `extract`: entries under these top-level folders of the zip go to their own folders
+    /// instead of `path`, e.g. BepInEx patchers (ADR 0023).
+    #[serde(default)]
+    pub routes: Option<Vec<Route>>,
+}
+
+/// Where one top-level folder of an unpacked zip goes, e.g. `patchers` to
+/// `BepInEx/patchers/Namespace-Name`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct Route {
+    /// A folder name at the top of the zip, matched ignoring case.
+    pub from: String,
+    /// A folder relative to the server's data directory, replaced like `path`; removed if the
+    /// zip has nothing for it.
+    pub to: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

@@ -1,12 +1,13 @@
 //! Downloads files from the internet into a server's data directory, e.g. mods (ADR 0017). HTTPS
 //! only; the file is moved into place only if size and hash match, otherwise nothing changes.
-//! With `extract` the file is a zip that is unpacked into a folder, replacing the old folder only
-//! once everything is unpacked (Thunderstore, ADR 0023).
+//! With `extract` the file is a zip that is unpacked into a folder (and its routes into further
+//! folders), replacing the old folders only once everything is unpacked (Thunderstore, ADR 0023).
 
 use crate::files;
 use cap_std::fs::{Dir, OpenOptions};
+use harrier_protocol::Route;
 use std::io::{ErrorKind, Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Larger files are refused: mods and plugins are megabytes, not gigabytes.
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -23,20 +24,24 @@ pub struct Expected<'a> {
     pub sha256: Option<&'a str>,
 }
 
-/// Downloads `url` to `path` inside `root` (with `extract`: unpacks it into the folder `path`);
-/// returns the downloaded size.
+/// Downloads `url` to `path` inside `root`; with `unpack` it is a zip unpacked into the folder
+/// `path` and the routes' folders. Returns the downloaded size.
 pub fn download(
     root: &Path,
     path: &str,
     url: &str,
     expected: &Expected,
-    extract: bool,
+    unpack: Option<&[Route]>,
 ) -> Result<u64, String> {
     if !url.starts_with("https://") {
         return Err("Only HTTPS downloads are allowed".into());
     }
     if expected.sha512.is_none() && expected.sha1.is_none() && expected.sha256.is_none() {
         return Err("A download needs a hash".into());
+    }
+    // Refused before anything is downloaded or written.
+    if let Some(routes) = unpack {
+        targets(path, routes)?;
     }
     let response = ureq::get(url)
         .header(
@@ -50,7 +55,7 @@ pub fn download(
         path,
         &mut response.into_body().into_reader(),
         expected,
-        extract,
+        unpack,
     )
 }
 
@@ -60,10 +65,10 @@ fn install(
     path: &str,
     body: &mut impl Read,
     expected: &Expected,
-    extract: bool,
+    unpack: Option<&[Route]>,
 ) -> Result<u64, String> {
     // A zip lives next to its folder only until it is unpacked.
-    let target = if extract {
+    let target = if unpack.is_some() {
         files::relative(path)?;
         format!("{path}.zip")
     } else {
@@ -115,62 +120,147 @@ fn install(
         }
         Ok(())
     });
-    match checked {
-        Ok(()) if extract => {
-            let unpacked = unpack(root, path, &mut upload.file);
+    match (checked, unpack) {
+        (Ok(()), Some(routes)) => {
+            let unpacked = unpack_zip(root, path, routes, &mut upload.file);
             upload.abort();
             unpacked.map(|()| size)
         }
-        Ok(()) => upload.finish().map(|()| size),
-        Err(e) => {
+        (Ok(()), None) => upload.finish().map(|()| size),
+        (Err(e), _) => {
             upload.abort();
             Err(e)
         }
     }
 }
 
-/// Unpacks the zip into a temporary folder next to the folder `path`, then swaps it in. Until the
-/// swap the old folder stays untouched, so a broken or oversized zip changes nothing.
-fn unpack(root: &Path, path: &str, zip: &mut std::fs::File) -> Result<(), String> {
-    let target = files::relative(path)?;
+/// One folder the zip is unpacked into: `path` itself or a route's `to`.
+struct Target<'a> {
+    path: &'a str,
+    /// Lower case; `None` for `path`, which takes everything no route takes.
+    from: Option<String>,
+    temp: PathBuf,
+    old: PathBuf,
+}
+
+/// `path` first, then one target per route. Folders must not overlap, or one swap would undo
+/// another.
+fn targets<'a>(path: &'a str, routes: &'a [Route]) -> Result<Vec<Target<'a>>, String> {
+    let main = std::iter::once((path, None));
+    let routed = routes.iter().map(|r| (r.to.as_str(), Some(&r.from)));
+    let mut found: Vec<Target> = Vec::new();
+    for (path, from) in main.chain(routed) {
+        let relative = files::relative(path)?;
+        if let Some(from) = from
+            && (from.is_empty()
+                || from.contains(['/', '\\'])
+                || matches!(from.as_str(), "." | ".."))
+        {
+            return Err(format!("Invalid folder \"{from}\" in a route"));
+        }
+        if let Some(other) = found
+            .iter()
+            .find(|t| Path::new(t.path).starts_with(relative) || relative.starts_with(t.path))
+        {
+            return Err(format!("\"{path}\" overlaps \"{}\"", other.path));
+        }
+        let parent = relative.parent().unwrap_or(Path::new(""));
+        let name = relative.file_name().unwrap_or_default().to_string_lossy();
+        found.push(Target {
+            path,
+            from: from.map(|f| f.to_ascii_lowercase()),
+            temp: parent.join(format!(".{name}.unpack{}", files::TEMP_SUFFIX)),
+            old: parent.join(format!(".{name}.old{}", files::TEMP_SUFFIX)),
+        });
+    }
+    Ok(found)
+}
+
+/// Unpacks the zip into a temporary folder next to `path` and next to each route's folder, then
+/// swaps them in. Until the swaps every old folder stays untouched, so a broken or oversized zip
+/// changes nothing. A route the zip has nothing for removes its old folder. Should a swap fail
+/// after others succeeded, those stay; installing again repairs it.
+fn unpack_zip(
+    root: &Path,
+    path: &str,
+    routes: &[Route],
+    zip: &mut std::fs::File,
+) -> Result<(), String> {
+    let targets = targets(path, routes)?;
     let failed = |e: std::io::Error| format!("Unpacking into \"{path}\": {e}");
     let dir = files::open_root(root).map_err(failed)?;
-    let parent = target.parent().unwrap_or(Path::new(""));
-    let name = target.file_name().unwrap_or_default().to_string_lossy();
-    let temp = parent.join(format!(".{name}.unpack{}", files::TEMP_SUFFIX));
-    let old = parent.join(format!(".{name}.old{}", files::TEMP_SUFFIX));
-    let _ = dir.remove_dir_all(&temp);
-    let _ = dir.remove_dir_all(&old);
-    dir.create_dir(&temp).map_err(failed)?;
-    let swapped = dir
-        .open_dir(&temp)
-        .map_err(failed)
-        .and_then(|into| unpack_into(&into, zip, path))
-        .and_then(|()| match dir.symlink_metadata(target) {
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                dir.rename(&temp, &dir, target).map_err(failed)
+    let cleanup = || {
+        for t in &targets {
+            let _ = dir.remove_dir_all(&t.temp);
+        }
+    };
+    let staged = (|| {
+        let mut into = Vec::new();
+        for t in &targets {
+            let _ = dir.remove_dir_all(&t.temp);
+            let _ = dir.remove_dir_all(&t.old);
+            if let Some(parent) = t.temp.parent().filter(|p| !p.as_os_str().is_empty()) {
+                dir.create_dir_all(parent).map_err(failed)?;
             }
-            Err(e) => Err(failed(e)),
-            Ok(meta) if !meta.is_dir() => Err(format!("\"{path}\" is not a folder")),
-            Ok(_) => {
-                dir.rename(target, &dir, &old).map_err(failed)?;
-                if let Err(e) = dir.rename(&temp, &dir, target) {
-                    let _ = dir.rename(&old, &dir, target);
-                    return Err(failed(e));
-                }
-                let _ = dir.remove_dir_all(&old);
-                Ok(())
-            }
-        });
-    if swapped.is_err() {
-        let _ = dir.remove_dir_all(&temp);
+            dir.create_dir(&t.temp).map_err(failed)?;
+            into.push(dir.open_dir(&t.temp).map_err(failed)?);
+        }
+        unpack_into(&targets, &into, zip, path)
+    })();
+    if let Err(e) = staged {
+        cleanup();
+        return Err(e);
     }
-    swapped
+    for t in &targets {
+        let empty = dir.read_dir(&t.temp).map_err(failed)?.next().is_none();
+        let swapped = if t.from.is_some() && empty {
+            let _ = dir.remove_dir(&t.temp);
+            match dir.remove_dir_all(t.path) {
+                Err(e) if e.kind() != ErrorKind::NotFound => Err(failed(e)),
+                _ => Ok(()),
+            }
+        } else {
+            swap(&dir, t)
+        };
+        if let Err(e) = swapped {
+            cleanup();
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Puts the unpacked temporary folder in place of `target.path`, keeping the old one until then.
+fn swap(dir: &Dir, target: &Target) -> Result<(), String> {
+    let path = target.path;
+    let failed = |e: std::io::Error| format!("Unpacking into \"{path}\": {e}");
+    match dir.symlink_metadata(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            dir.rename(&target.temp, dir, path).map_err(failed)
+        }
+        Err(e) => Err(failed(e)),
+        Ok(meta) if !meta.is_dir() => Err(format!("\"{path}\" is not a folder")),
+        Ok(_) => {
+            dir.rename(path, dir, &target.old).map_err(failed)?;
+            if let Err(e) = dir.rename(&target.temp, dir, path) {
+                let _ = dir.rename(&target.old, dir, path);
+                return Err(failed(e));
+            }
+            let _ = dir.remove_dir_all(&target.old);
+            Ok(())
+        }
+    }
 }
 
 /// Every entry must be a plain relative path (as in the file manager) and is created relative to
-/// `into`, so nothing can land outside it. Symlinks are refused; file modes are not kept.
-fn unpack_into(into: &Dir, zip: &mut std::fs::File, path: &str) -> Result<(), String> {
+/// its target's folder (a route's entries without their top folder), so nothing can land outside
+/// them. Symlinks are refused; file modes are not kept.
+fn unpack_into(
+    targets: &[Target],
+    into: &[Dir],
+    zip: &mut std::fs::File,
+    path: &str,
+) -> Result<(), String> {
     let bad = |e: zip::result::ZipError| format!("\"{path}\" is not a valid zip: {e}");
     zip.rewind().map_err(|e| format!("Reading {path}: {e}"))?;
     let mut archive = zip::ZipArchive::new(zip).map_err(bad)?;
@@ -185,7 +275,19 @@ fn unpack_into(into: &Dir, zip: &mut std::fs::File, path: &str) -> Result<(), St
         if entry.is_symlink() {
             return Err(format!("The zip contains a symlink \"{name}\""));
         }
-        let relative = files::relative(&name)?;
+        // A route takes everything below its top folder; the rest goes to `path` (index 0).
+        let (index, inner) = match name.split_once('/') {
+            Some((top, rest)) => targets
+                .iter()
+                .position(|t| t.from.as_deref() == Some(top.to_ascii_lowercase().as_str()))
+                .map_or((0, name.as_str()), |i| (i, rest)),
+            None => (0, name.as_str()),
+        };
+        if index > 0 && inner.trim_end_matches('/').is_empty() {
+            continue; // the route's top folder itself
+        }
+        let relative = files::relative(inner)?;
+        let into = &into[index];
         let failed = |e: std::io::Error| format!("Unpacking \"{name}\": {e}");
         if entry.is_dir() {
             into.create_dir_all(relative).map_err(failed)?;
@@ -224,7 +326,7 @@ mod tests {
             sha256: None,
         };
         assert!(
-            download(&root, "mods/x.jar", "http://example.com/x.jar", &any, false)
+            download(&root, "mods/x.jar", "http://example.com/x.jar", &any, None)
                 .unwrap_err()
                 .contains("HTTPS")
         );
@@ -240,7 +342,7 @@ mod tests {
                 "mods/x.jar",
                 "https://example.com/x.jar",
                 &none,
-                true
+                Some(&[])
             )
             .unwrap_err()
             .contains("hash")
@@ -272,6 +374,15 @@ mod tests {
 
     /// Installs `bytes` as the mod, checked against `hash` (default: its own SHA-256).
     fn put(root: &Path, bytes: &[u8], hash: Option<&str>) -> Result<u64, String> {
+        put_routed(root, bytes, hash, &[])
+    }
+
+    fn put_routed(
+        root: &Path,
+        bytes: &[u8],
+        hash: Option<&str>,
+        routes: &[Route],
+    ) -> Result<u64, String> {
         let own = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes));
         let expected = Expected {
             size: None,
@@ -279,7 +390,16 @@ mod tests {
             sha1: None,
             sha256: Some(hash.unwrap_or(&own)),
         };
-        install(root, MOD, &mut &bytes[..], &expected, true)
+        install(root, MOD, &mut &bytes[..], &expected, Some(routes))
+    }
+
+    const PATCHERS: &str = "BepInEx/patchers/Author-Mod";
+
+    fn patchers() -> Vec<Route> {
+        vec![Route {
+            from: "patchers".into(),
+            to: PATCHERS.into(),
+        }]
     }
 
     /// Everything below `dir`, as sorted relative paths.
@@ -365,6 +485,85 @@ mod tests {
             std::fs::read(root.join(MOD).join("Mod.dll")).unwrap(),
             b"old"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn routes_top_folders_into_their_own_folders() {
+        let root = temp_root("unpack-routes");
+        let first = zip(&[
+            ("manifest.json", b"{}"),
+            ("plugins/Mod.dll", b"plugin"),
+            ("Patchers/", b""),
+            ("Patchers\\Mod.Patchers.dll", b"patcher v1"),
+        ]);
+        put_routed(&root, &first, None, &patchers()).unwrap();
+        assert_eq!(
+            tree(&root.join("BepInEx")),
+            [
+                "patchers",
+                "patchers/Author-Mod",
+                "patchers/Author-Mod/Mod.Patchers.dll",
+                "plugins",
+                "plugins/Author-Mod",
+                "plugins/Author-Mod/manifest.json",
+                "plugins/Author-Mod/plugins",
+                "plugins/Author-Mod/plugins/Mod.dll",
+            ],
+            "patchers/ (any case) goes to its route, the rest to the mod's folder"
+        );
+
+        // A broken update changes neither folder.
+        let before = tree(&root);
+        let broken = zip(&[("patchers/new.dll", b"x"), ("../evil", b"x")]);
+        assert!(put_routed(&root, &broken, None, &patchers()).is_err());
+        assert_eq!(tree(&root), before);
+
+        // An update without patchers removes the old route folder.
+        put_routed(
+            &root,
+            &zip(&[("plugins/Mod.dll", b"v2")]),
+            None,
+            &patchers(),
+        )
+        .unwrap();
+        assert!(!root.join(PATCHERS).exists());
+        assert_eq!(
+            std::fs::read(root.join(MOD).join("plugins/Mod.dll")).unwrap(),
+            b"v2"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refuses_bad_routes_before_writing_anything() {
+        let root = temp_root("unpack-bad-routes");
+        let bytes = zip(&[("patchers/a.dll", b"x")]);
+        let route = |from: &str, to: &str| {
+            vec![Route {
+                from: from.into(),
+                to: to.into(),
+            }]
+        };
+        for (case, routes) in [
+            ("parent", route("patchers", "BepInEx/../../etc")),
+            ("absolute", route("patchers", "/etc")),
+            ("nested folder name", route("a/b", "BepInEx/patchers/x")),
+            (
+                "inside the mod",
+                route("patchers", "BepInEx/plugins/Author-Mod/p"),
+            ),
+            ("same as the mod", route("patchers", MOD)),
+        ] {
+            assert!(
+                put_routed(&root, &bytes, None, &routes).is_err(),
+                "{case} must be refused"
+            );
+            assert!(
+                !root.exists() || tree(&root).iter().all(|p| !p.contains("patchers")),
+                "{case}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
