@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/harrier-gg/agent/compare/v0.8.2...v0.9.0) (2026-11-17)
+
+
+### Features
+
+* unpack top-level zip folders into their own folders (routes), for BepInEx patchers ([#47](https://github.com/harrier-gg/agent/issues/47)) ([3d6396f](https://github.com/harrier-gg/agent/commit/3d6396f90142bf6345356a8064aafbabbd1fa157))
+
 ## [0.8.2](https://github.com/harrier-gg/agent/compare/v0.8.1...v0.8.2) (2026-11-16)
 
 
