@@ -1187,6 +1187,7 @@ impl Runtime {
             sha1,
             sha256,
             extract,
+            routes,
         } = request;
         let result = self
             .in_server_dir(&server_id, move |dir| {
@@ -1196,7 +1197,9 @@ impl Runtime {
                     sha1: sha1.as_deref(),
                     sha256: sha256.as_deref(),
                 };
-                download::download(dir, &path, &url, &expected, extract == Some(true))
+                // Routes only apply to zips; without `extract` the file is written as it is.
+                let unpack = (extract == Some(true)).then(|| routes.unwrap_or_default());
+                download::download(dir, &path, &url, &expected, unpack.as_deref())
             })
             .await;
         if let Ok(size) = &result {
